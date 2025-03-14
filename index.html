@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bin2Iso - Convert BIN/CUE to ISO</title>
+    <style>
+      :root {
+        --primary: #6366f1;
+        --primary-hover: #4f46e5;
+        --success: #10b981;
+        --error: #ef4444;
+        --bg: #f9fafb;
+        --card-bg: #ffffff;
+        --text: #1f2937;
+        --text-secondary: #6b7280;
+        --border: #e5e7eb;
+        --accent: #8b5cf6;
+      }
+
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+          Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue',
+          sans-serif;
+        line-height: 1.6;
+        color: var(--text);
+        background-color: var(--bg);
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      .container {
+        width: 100%;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 2rem 1.5rem;
+      }
+
+      header {
+        text-align: center;
+        margin-bottom: 2.5rem;
+      }
+
+      h1 {
+        font-size: 2.5rem;
+        margin-bottom: 0.5rem;
+        font-weight: 800;
+        background: linear-gradient(
+          90deg,
+          var(--primary) 0%,
+          var(--accent) 100%
+        );
+        -webkit-background-clip: text;
+        background-clip: text;
+        -webkit-text-fill-color: transparent;
+        text-fill-color: transparent;
+      }
+
+      .tagline {
+        font-size: 1.1rem;
+        color: var(--text-secondary);
+      }
+
+      .converter-card {
+        background: var(--card-bg);
+        border-radius: 16px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
+        padding: 2rem;
+        margin-bottom: 2rem;
+        transition: all 0.3s ease;
+      }
+
+      .upload-area {
+        border: 2px dashed var(--border);
+        border-radius: 12px;
+        padding: 2.5rem 2rem;
+        text-align: center;
+        margin-bottom: 1.5rem;
+        transition: all 0.3s ease;
+        cursor: pointer;
+        background-color: var(--bg);
+      }
+
+      .upload-area.drag-over {
+        border-color: var(--primary);
+        background-color: rgba(99, 102, 241, 0.05);
+      }
+
+      .upload-area:hover {
+        border-color: var(--primary);
+        transform: translateY(-2px);
+      }
+
+      .upload-icon {
+        font-size: 3.5rem;
+        margin-bottom: 1.5rem;
+        color: var(--primary);
+      }
+
+      .upload-text h3 {
+        margin-bottom: 0.75rem;
+        font-weight: 600;
+        font-size: 1.25rem;
+      }
+
+      .upload-text p {
+        color: var(--text-secondary);
+        margin-bottom: 1.25rem;
+      }
+
+      .file-input {
+        display: none;
+      }
+
+      .browse-btn {
+        background-color: var(--primary);
+        color: white;
+        border: none;
+        padding: 0.75rem 1.5rem;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 1rem;
+        font-weight: 500;
+        transition: all 0.3s ease;
+        box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+      }
+
+      .browse-btn:hover {
+        background-color: var(--primary-hover);
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px rgba(99, 102, 241, 0.3);
+      }
+
+      .browse-btn:active {
+        transform: translateY(0);
+      }
+
+      .file-info {
+        display: none;
+        margin-top: 1.5rem;
+        padding: 1.25rem;
+        background-color: var(--bg);
+        border-radius: 12px;
+        border-left: 4px solid var(--primary);
+      }
+
+      .file-info.visible {
+        display: block;
+        animation: fadeIn 0.5s ease;
+      }
+
+      .file-info p {
+        margin-bottom: 0.5rem;
+      }
+
+      .file-info p:last-child {
+        margin-bottom: 0;
+      }
+
+      .convert-btn {
+        display: none;
+        background: linear-gradient(
+          90deg,
+          var(--primary) 0%,
+          var(--accent) 100%
+        );
+        color: white;
+        border: none;
+        padding: 1rem 1.5rem;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 1rem;
+        font-weight: 600;
+        margin-top: 1.5rem;
+        transition: all 0.3s ease;
+        width: 100%;
+        text-align: center;
+        box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+      }
+
+      .convert-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px rgba(99, 102, 241, 0.3);
+      }
+
+      .convert-btn:disabled {
+        opacity: 0.7;
+        cursor: not-allowed;
+        transform: none;
+        box-shadow: none;
+      }
+
+      .convert-btn.visible {
+        display: block;
+        animation: fadeIn 0.5s ease;
+      }
+
+      .status-area {
+        display: none;
+        margin-top: 1.5rem;
+        animation: fadeIn 0.5s ease;
+      }
+
+      .status-area.visible {
+        display: block;
+      }
+
+      .progress-container {
+        width: 100%;
+        height: 8px;
+        background-color: var(--bg);
+        border-radius: 4px;
+        margin-bottom: 1.25rem;
+        overflow: hidden;
+      }
+
+      .progress-bar {
+        height: 100%;
+        width: 0;
+        border-radius: 4px;
+        background: linear-gradient(
+          90deg,
+          var(--primary) 0%,
+          var(--accent) 100%
+        );
+        transition: width 0.3s ease;
+      }
+
+      .status-text {
+        font-size: 0.95rem;
+        margin-bottom: 1.25rem;
+        color: var(--text-secondary);
+      }
+
+      .download-btn {
+        display: none;
+        background: var(--success);
+        color: white;
+        border: none;
+        padding: 1rem 1.5rem;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 1rem;
+        font-weight: 600;
+        transition: all 0.3s ease;
+        text-decoration: none;
+        text-align: center;
+        box-shadow: 0 4px 12px rgba(16, 185, 129, 0.2);
+      }
+
+      .download-btn:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 16px rgba(16, 185, 129, 0.3);
+        background: #0ca678;
+      }
+
+      .download-btn.visible {
+        display: block;
+        animation: fadeIn 0.5s ease;
+      }
+
+      .alert {
+        padding: 1rem 1.25rem;
+        border-radius: 8px;
+        margin-bottom: 1.5rem;
+        color: white;
+        display: flex;
+        align-items: center;
+        animation: fadeIn 0.5s ease;
+        display: none;
+      }
+
+      .alert svg {
+        margin-right: 0.75rem;
+        flex-shrink: 0;
+      }
+
+      .alert.error {
+        background-color: var(--error);
+        display: flex;
+      }
+
+      .alert.success {
+        background-color: var(--success);
+        display: flex;
+      }
+
+      .how-it-works {
+        background: var(--card-bg);
+        border-radius: 16px;
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.05);
+        padding: 2rem;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .how-it-works::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 6px;
+        height: 100%;
+        background: linear-gradient(to bottom, var(--primary), var(--accent));
+        border-top-left-radius: 16px;
+        border-bottom-left-radius: 16px;
+      }
+
+      .how-it-works h2 {
+        margin-bottom: 1.5rem;
+        font-weight: 700;
+        font-size: 1.5rem;
+        color: var(--text);
+      }
+
+      .steps {
+        list-style-type: none;
+        padding-left: 0;
+      }
+
+      .steps li {
+        position: relative;
+        padding-left: 3.5rem;
+        margin-bottom: 2rem;
+        counter-increment: step-counter;
+      }
+
+      .steps li:last-child {
+        margin-bottom: 0;
+      }
+
+      .steps li::before {
+        content: counter(step-counter);
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        background: linear-gradient(
+          135deg,
+          var(--primary) 0%,
+          var(--accent) 100%
+        );
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
+      }
+
+      .steps h3 {
+        margin-bottom: 0.5rem;
+        font-weight: 600;
+        font-size: 1.125rem;
+      }
+
+      .steps p {
+        color: var(--text-secondary);
+        font-size: 0.95rem;
+      }
+
+      footer {
+        text-align: center;
+        margin-top: auto;
+        padding: 2rem 1.5rem;
+        font-size: 0.9rem;
+        color: var(--text-secondary);
+      }
+
+      @keyframes fadeIn {
+        from {
+          opacity: 0;
+          transform: translateY(10px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      @media (max-width: 768px) {
+        .container {
+          padding: 1.5rem 1rem;
+        }
+
+        h1 {
+          font-size: 2rem;
+        }
+
+        .converter-card,
+        .how-it-works {
+          padding: 1.5rem;
+        }
+
+        .upload-area {
+          padding: 2rem 1rem;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Bin2Iso Converter</h1>
+        <p class="tagline">Quickly convert BIN/CUE files to ISO format</p>
+      </header>
+
+      <div class="converter-card">
+        <div id="alertArea"></div>
+
+        <div id="uploadArea" class="upload-area">
+          <div class="upload-icon">
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="64"
+              height="64"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="17 8 12 3 7 8"></polyline>
+              <line x1="12" y1="3" x2="12" y2="15"></line>
+            </svg>
+          </div>
+          <div class="upload-text">
+            <h3>Upload your BIN or CUE file</h3>
+            <p>Drag & drop your file here or click to browse</p>
+            <button class="browse-btn">Browse Files</button>
+          </div>
+          <input
+            type="file"
+            id="fileInput"
+            class="file-input"
+            accept=".bin,.cue"
+          />
+        </div>
+
+        <div id="fileInfo" class="file-info">
+          <p><strong>File name:</strong> <span id="fileName">-</span></p>
+          <p><strong>File size:</strong> <span id="fileSize">-</span></p>
+          <p><strong>File type:</strong> <span id="fileType">-</span></p>
+        </div>
+
+        <button id="convertBtn" class="convert-btn">Convert to ISO</button>
+
+        <div id="statusArea" class="status-area">
+          <div class="progress-container">
+            <div id="progressBar" class="progress-bar"></div>
+          </div>
+          <p id="statusText" class="status-text">Starting conversion...</p>
+          <a id="downloadBtn" class="download-btn" href="#" download>
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              width="20"
+              height="20"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="2"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+              style="margin-right: 8px; vertical-align: middle"
+            >
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            Download ISO File
+          </a>
+        </div>
+      </div>
+
+      <div class="how-it-works">
+        <h2>How It Works</h2>
+        <ul class="steps">
+          <li>
+            <h3>Upload your file</h3>
+            <p>
+              Select a BIN or CUE file from your computer by drag & drop or file
+              browser.
+            </p>
+          </li>
+          <li>
+            <h3>Convert</h3>
+            <p>
+              Our system will automatically process and convert your file to ISO
+              format.
+            </p>
+          </li>
+          <li>
+            <h3>Download</h3>
+            <p>
+              Once conversion is complete, download your ISO file with a single
+              click.
+            </p>
+          </li>
+        </ul>
+      </div>
+    </div>
+
+    <footer>
+      &copy; 2025 Bin2Iso Converter | Free Online BIN/CUE to ISO Converter
+    </footer>
+
+    <script>
+      document.addEventListener('DOMContentLoaded', function () {
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileSize = document.getElementById('fileSize');
+        const fileType = document.getElementById('fileType');
+        const convertBtn = document.getElementById('convertBtn');
+        const statusArea = document.getElementById('statusArea');
+        const progressBar = document.getElementById('progressBar');
+        const statusText = document.getElementById('statusText');
+        const downloadBtn = document.getElementById('downloadBtn');
+        const alertArea = document.getElementById('alertArea');
+
+        // Open file dialog when clicking on the upload area
+        uploadArea.addEventListener('click', function () {
+          fileInput.click();
+        });
+
+        // Drag and drop functionality
+        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach((eventName) => {
+          uploadArea.addEventListener(eventName, preventDefaults, false);
+        });
+
+        function preventDefaults(e) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+
+        ['dragenter', 'dragover'].forEach((eventName) => {
+          uploadArea.addEventListener(eventName, highlight, false);
+        });
+
+        ['dragleave', 'drop'].forEach((eventName) => {
+          uploadArea.addEventListener(eventName, unhighlight, false);
+        });
+
+        function highlight() {
+          uploadArea.classList.add('drag-over');
+        }
+
+        function unhighlight() {
+          uploadArea.classList.remove('drag-over');
+        }
+
+        uploadArea.addEventListener('drop', handleDrop, false);
+
+        function handleDrop(e) {
+          const dt = e.dataTransfer;
+          const files = dt.files;
+          if (files.length) {
+            handleFiles(files[0]);
+          }
+        }
+
+        // Handle file selection
+        fileInput.addEventListener('change', function () {
+          if (fileInput.files.length) {
+            handleFiles(fileInput.files[0]);
+          }
+        });
+
+        function handleFiles(file) {
+          const validExtensions = ['.bin', '.cue'];
+          const fileExtension = '.' + file.name.split('.').pop().toLowerCase();
+
+          if (!validExtensions.includes(fileExtension)) {
+            showAlert('Please upload a valid BIN or CUE file.', 'error');
+            return;
+          }
+
+          // Clear any existing alerts
+          alertArea.innerHTML = '';
+
+          // Display file info
+          fileName.textContent = file.name;
+          fileSize.textContent = formatBytes(file.size);
+          fileType.textContent =
+            file.type || fileExtension.toUpperCase().substring(1) + ' File';
+          fileInfo.classList.add('visible');
+          convertBtn.classList.add('visible');
+
+          // Store the file for later use
+          window.selectedFile = file;
+        }
+
+        // Format bytes to human-readable size
+        function formatBytes(bytes, decimals = 2) {
+          if (bytes === 0) return '0 Bytes';
+
+          const k = 1024;
+          const dm = decimals < 0 ? 0 : decimals;
+          const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+
+          const i = Math.floor(Math.log(bytes) / Math.log(k));
+
+          return (
+            parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i]
+          );
+        }
+
+        // Handle conversion button click
+        convertBtn.addEventListener('click', function () {
+          if (!window.selectedFile) {
+            showAlert('Please select a file first.', 'error');
+            return;
+          }
+
+          startConversion();
+        });
+
+        function startConversion() {
+          // Show the status area
+          statusArea.classList.add('visible');
+          progressBar.style.width = '0%';
+          statusText.textContent = 'Uploading file...';
+          convertBtn.disabled = true;
+
+          // Create FormData and append the file
+          const formData = new FormData();
+          formData.append('file', window.selectedFile);
+
+          // Simulate upload and conversion (replace with actual API call)
+          simulateConversion(formData);
+        }
+
+        function simulateConversion(formData) {
+          // In a real implementation, replace this with your API call
+          // Here we're just simulating the process with a timeout
+
+          // Simulate upload progress
+          let progress = 0;
+          const uploadInterval = setInterval(() => {
+            progress += 5;
+            progressBar.style.width = `${progress}%`;
+
+            if (progress >= 100) {
+              clearInterval(uploadInterval);
+              statusText.textContent = 'File uploaded. Converting to ISO...';
+
+              // Simulate conversion
+              setTimeout(() => {
+                statusText.textContent = 'Conversion complete!';
+                downloadBtn.classList.add('visible');
+                downloadBtn.href = '#'; // Replace with actual download URL
+                showAlert(
+                  'Your file has been successfully converted to ISO format.',
+                  'success'
+                );
+                convertBtn.disabled = false;
+
+                // In real implementation, set the href to the actual download URL
+                // downloadBtn.href = response.downloadUrl;
+
+                // For demo purposes, let's create a simulated ISO file
+                const blob = new Blob(['Simulated ISO file content'], {
+                  type: 'application/octet-stream',
+                });
+                const url = URL.createObjectURL(blob);
+                downloadBtn.href = url;
+                downloadBtn.download = window.selectedFile.name.replace(
+                  /\.(bin|cue)$/i,
+                  '.iso'
+                );
+              }, 2000);
+            }
+          }, 100);
+
+          // In a real implementation, use fetch or axios to send the file to your backend
+          /*
+                fetch('/api/convert', {
+                    method: 'POST',
+                    body: formData,
+                    onUploadProgress: (progressEvent) => {
+                        const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+                        progressBar.style.width = `${percentCompleted}%`;
+                    }
+                })
+                .then(response => response.json())
+                .then(data => {
+                    statusText.textContent = 'Conversion complete!';
+                    downloadBtn.classList.add('visible');
+                    downloadBtn.href = data.downloadUrl;
+                    downloadBtn.download = data.fileName;
+                    showAlert('Your file has been successfully converted to ISO format.', 'success');
+                    convertBtn.disabled = false;
+                })
+                .catch(error => {
+                    statusText.textContent = 'Error during conversion.';
+                    showAlert('An error occurred during the conversion process. Please try again.', 'error');
+                    convertBtn.disabled = false;
+                });
+                */
+        }
+
+        function showAlert(message, type) {
+          let icon = '';
+
+          if (type === 'success') {
+            icon =
+              '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>';
+          } else if (type === 'error') {
+            icon =
+              '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>';
+          }
+
+          alertArea.innerHTML = `<div class="alert ${type}">${icon}${message}</div>`;
+        }
+      });
+    </script>
+  </body>
+</html>
