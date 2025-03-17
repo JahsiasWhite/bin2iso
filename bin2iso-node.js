@@ -115,7 +115,7 @@ class options {
 // global variables
 // FILE * fdOutFile;
 let fdOutFile;
-let cueDirectory = new Array(256).fill('');
+let cueDirectory = '';
 
 // Best buffer size varies by machine, 1-4Mb generally best. 2Mb write worked best on my machine.
 // I also tried doing direct fwrites instead of buffering, but that was slightly slower somehow.
@@ -162,19 +162,30 @@ function strcpylower(out_str, in_str) {
   out_str[i] = '';
 }
 
-function getFileSize(file) {
-  if (file.seek(0, 'end') !== 0) {
-    console.error('bin2iso(fseek)');
+// TODO
+// function GetFileSize(file) {
+//   if (file.seek(0, 'end') !== 0) {
+//     console.error('bin2iso(fseek)');
+//     process.exit(1);
+//   }
+//   return file.tell();
+// }
+function GetFileSize(file) {
+  // Open the file for reading
+  try {
+    const stats = fs.statSync('TEST/TEST.bin');
+    return stats.size;
+  } catch (err) {
+    console.error('Error getting file stats:', err);
     process.exit(1);
   }
-  return file.tell();
 }
 
-function openCaseless(filename) {
+function OpenCaseless(filename) {
   // If using a CUE file outside the current working directory, presumably BIN files are next
   // to the CUE so go to that directory temporarily.
   const cwd = process.cwd();
-  if (cueDirectory !== '') {
+  if (cueDirectory.length > 0) {
     try {
       process.chdir(cueDirectory);
     } catch (err) {
@@ -187,7 +198,8 @@ function openCaseless(filename) {
   let fd = null;
 
   try {
-    fd = fs.openSync(filename, filemode);
+    // fd = fs.openSync(filename, filemode);
+    fd = fs.readFileSync(filename, 'utf8');
   } catch (err) {
     // If not found at exact casing, look for a variant-case file.
     const dir = fs.opendirSync('.');
@@ -360,7 +372,7 @@ function FlushBuffers(fdBinFile) {
 
 function DoTrack(track) {
   let fdBinFile = track.fdSrcFile;
-  uint8_t * buffer; // this is a pointer to somewhere in inBuf, for zero-copy reads
+  let buffer; // this is a pointer to somewhere in inBuf, for zero-copy reads
   let remainingsectors = track.totalSectors;
 
   let sOutFilename;
@@ -474,77 +486,44 @@ function DoTrack(track) {
 }
 
 // TODO THIS WHOLE FUNCTION
-function ParseCueLine(readp, activefile, track) {
+function ParseCueLine(readp, track) {
   // For reference:
   // https://www.gnu.org/software/ccd2cue/manual/html_node/CUE-sheet-format.html#CUE-sheet-format
   // https://kodi.wiki/view/Cue_sheets
 
   // Skip leading spaces. Usually there's an exact amount of whitespace for each command, but
   // some CUE file generators produce fewer or more spaces. Should skip tab too?..
-  // TODO
-  while (readp === ' ' || readp === '\n' || readp === '\r') readp++;
-  if (readp === '\0') return track; // empty line
+  while (readp[0] === ' ' || readp[0] === '\n' || readp[0] === '\r') {
+    readp = readp.slice(1); // Move forward (equivalent to readp++)
+  }
+  if (readp.length === 0) return track; // empty line
 
   // FILE "<filename>" <MODE>
   // The filename might include an absolute or relative directory, but usually is just the file.
   // Filename is usually in quotes, but they can be omitted if it has no spaces.
   // Mode is usually BINARY, but could be WAVE, AIFF, MP3. Also MOTOROLA for big-endian binary.
   // We only want the filename, ignore the mode.
-  // TODO
   if (readp.startsWith('FILE ')) {
-    readp += 5;
+    readp = readp.slice(5); // Skip "FILE "
     while (readp[0] == ' ') readp = readp.slice(1); // just in case
 
     let writep = activefile;
     let terminator = ' ';
 
-    for (let i = 0; i < readp.length; i++) {
-      const char = readp[i];
+    while (readp.length > 0 && readp[0] !== terminator) {
+      let char = readp[0];
 
-      switch (char.charCodeAt(0)) {
-        case 1:
-        case 2:
-        case 3:
-        case 4:
-        case 5:
-        case 6:
-        case 7:
-        case 8:
-        case 9:
-        case 10:
-        case 11:
-        case 12:
-        case 13:
-        case 14:
-        case 15:
-        case 16:
-        case 17:
-        case 18:
-        case 19:
-        case 20:
-        case 21:
-        case 22:
-        case 23:
-        case 24:
-        case 25:
-        case 26:
-        case 27:
-        case 28:
-        case 29:
-        case 30:
-        case 31:
-          // Ignore unexpected control characters silently.
+      switch (true) {
+        case char.charCodeAt(0) >= 1 && char.charCodeAt(0) <= 31:
+          // Ignore unexpected control characters silently
           break;
 
-        case '/':
-        case '\\':
-          // Just ignore anything to the left of every path separator.
-          // Technically incorrect, but directory references in CUE files are invalid
-          // more often than not...
-          writep = activefile;
+        case char === '/' || char === '\\':
+          // Ignore anything to the left of a path separator
+          writep = '';
           break;
 
-        case '"'.charCodeAt(0):
+        case char === '"':
           terminator = '"';
           break;
 
@@ -552,9 +531,11 @@ function ParseCueLine(readp, activefile, track) {
           writep += char;
           break;
       }
+
+      readp = readp.slice(1); // Move pointer forward (like readp++)
     }
 
-    if (terminator == '"' && readp != '"') {
+    if (terminator == '"' && readp[0] != '"') {
       console.log(
         "Error: Unpaired \" in 'FILE' in cuefile %s\n",
         options.sCueFilename
@@ -579,8 +560,8 @@ function ParseCueLine(readp, activefile, track) {
   // The number doesn't have to have a leading 0. It should grow by +1 for each new track.
   // The track's source FILE context must have appeared already.
   // DATATYPE is AUDIO or one of several binary data descriptors.
-  else if (strncmp(readp, 'TRACK ', 6) == 0) {
-    readp += 6;
+  else if (readp.startsWith('TRACK ')) {
+    readp = readp.slice(6);
     // while (*readp == ' ') readp++;
     while (readp[0] === ' ') readp++;
 
@@ -599,14 +580,14 @@ function ParseCueLine(readp, activefile, track) {
     track.predata = 0;
     track.postdata = 0;
 
-    if (activefile[0] == '\0') {
+    if (activefile.length === 0) {
       console.log(
         'Error: TRACK before FILE in cuefile %s\n',
         options.sCueFilename
       );
-      exit(1);
+      process.exit(1);
     }
-    strcpy(track.sSrcFileName, activefile);
+    track.sSrcFileName = activefile;
     track.fdSrcFile = OpenCaseless(activefile);
 
     // Read the index number straight into track.num, use numstr to refer back to this index.
@@ -617,9 +598,11 @@ function ParseCueLine(readp, activefile, track) {
       readp = readp.slice(1);
     }
     readp = '\0' + readp.slice(1); // numstr terminator
-    while (readp.charAt(0) === ' ') {
-      readp = readp.slice(1);
-    }
+    // while (readp.charAt(0) === ' ') {
+    //   readp = readp.slice(1);
+    // }
+    readp = readp.replace(/^\0+/, ''); // Remove any leading null characters
+    readp = readp.replace(/^\s+/, ''); // Remove leading spaces and other whitespace characters
 
     // Regarding modes - https://en.wikipedia.org/wiki/CD-ROM
     // CD sectors always contains 2352 bytes. Depending on mode, part of that space is used
@@ -627,17 +610,17 @@ function ParseCueLine(readp, activefile, track) {
     // for any track, the sector index is always multiplied by 2352.
     // However, a disk image may be saved with an unusual sector size, omitting part of the
     // physical 2352 bytes, or including subchannel data to go above 2352 bytes.
-    if (strncmp(readp, 'AUDIO/', 6) == 0) track.mode = MODE_AUDIOSUB;
-    else if (strncmp(readp, 'AUDIO', 5) == 0) track.mode = MODE_AUDIO;
-    else if (strncmp(readp, 'MODE1/2352', 10) == 0) track.mode = MODE1_2352;
-    else if (strncmp(readp, 'MODE1/2048', 10) == 0) track.mode = MODE1_2048;
-    else if (strncmp(readp, 'MODE1/2448', 10) == 0) track.mode = MODE1_2448;
-    else if (strncmp(readp, 'MODE2/2352', 10) == 0) track.mode = MODE2_2352;
-    else if (strncmp(readp, 'MODE2/2336', 10) == 0) track.mode = MODE2_2336;
-    else if (strncmp(readp, 'MODE2/2448', 10) == 0) track.mode = MODE2_2448;
+    if (readp.startsWith('AUDIO/')) track.mode = MODE_AUDIOSUB;
+    else if (readp.startsWith('AUDIO')) track.mode = MODE_AUDIO;
+    else if (readp.startsWith('MODE1/2352')) track.mode = MODE1_2352;
+    else if (readp.startsWith('MODE1/2048')) track.mode = MODE1_2048;
+    else if (readp.startsWith('MODE1/2448')) track.mode = MODE1_2448;
+    else if (readp.startsWith('MODE2/2352')) track.mode = MODE2_2352;
+    else if (readp.startsWith('MODE2/2336')) track.mode = MODE2_2336;
+    else if (readp.startsWith('MODE2/2448')) track.mode = MODE2_2448;
     else {
       console.log('Error: Track %s - Unknown mode: [%s]\n', numstr, readp);
-      exit(1);
+      process.exit(1);
     }
 
     switch (track.mode) {
@@ -683,9 +666,11 @@ function ParseCueLine(readp, activefile, track) {
     track.name += '-';
     track.name += numstr;
 
-    if (track.mode == MODE_AUDIO || track.mode == MODE_AUDIOSUB)
-      strcat(track.name, '.wav');
-    else strcat(track.name, '.iso');
+    if (track.mode === 'MODE_AUDIO' || track.mode === 'MODE_AUDIOSUB') {
+      track.name += '.wav';
+    } else {
+      track.name += '.iso';
+    }
   }
 
   // INDEX <number> <mm:ss:ff>
@@ -694,11 +679,11 @@ function ParseCueLine(readp, activefile, track) {
   // The index's source TRACK context must have appeared already.
   // The time value is a time-encoded offset relative to the start of the FILE, which converts
   // to a sector index.
-  else if (strncmp(readp, 'INDEX ', 6) == 0) {
+  else if (readp.startsWith('INDEX ')) {
     readp = readp.slice(6);
     while (readp.charAt(0) === ' ') readp = readp.slice(1);
 
-    if (track == NULL) {
+    if (track == null) {
       console.log(
         'Error: INDEX without active TRACK cuefile %s\n',
         options.sCueFilename
@@ -750,18 +735,18 @@ function ParseCueLine(readp, activefile, track) {
 
   // The pre- and postgap commands supposedly are there to request an artificial gap be added,
   // which is not actually in the source data. Let's ignore those...
-  else if (strncmp(readp, 'PREGAP ', 7) == 0) {
-  } else if (strncmp(readp, 'POSTGAP ', 8) == 0) {
+  else if (readp.startsWith('PREGAP ')) {
+  } else if (readp.startsWith('POSTGAP ')) {
   }
   // Other functionally uninteresting commands, ignore.
-  else if (strncmp(readp, 'CDTEXTFILE ', 11) == 0) {
-  } else if (strncmp(readp, 'SONGWRITER ', 11) == 0) {
-  } else if (strncmp(readp, 'PERFORMER ', 10) == 0) {
-  } else if (strncmp(readp, 'CATALOG ', 8) == 0) {
-  } else if (strncmp(readp, 'FLAGS ', 6) == 0) {
-  } else if (strncmp(readp, 'TITLE ', 6) == 0) {
-  } else if (strncmp(readp, 'ISRC ', 5) == 0) {
-  } else if (strncmp(readp, 'REM ', 4) == 0) {
+  else if (readp.startsWith('CDTEXTFILE ')) {
+  } else if (readp.startsWith('SONGWRITER ')) {
+  } else if (readp.startsWith('PERFORMER ')) {
+  } else if (readp.startsWith('CATALOG ')) {
+  } else if (readp.startsWith('FLAGS ')) {
+  } else if (readp.startsWith('TITLE ')) {
+  } else if (readp.startsWith('ISRC ')) {
+  } else if (readp.startsWith('REM ')) {
   } else {
     console.log('Unrecognised line in CUE: "%s"\n', readp);
   }
@@ -791,27 +776,14 @@ function ParseCue() {
 
   // Extract directory from cue path, removing final directory separator if present.
   // Known limitation: on Windows, drive-relative paths fail. ("bin2cue X:ab.cue")
-  let cueDirectory = options.sCueFilename;
-  let readp = cueDirectory.length;
-  while (
-    readp > 0 &&
-    cueDirectory[readp - 1] !== '/' &&
-    cueDirectory[readp - 1] !== '\\'
-  ) {
-    readp--;
-  }
-  cueDirectory = cueDirectory.substring(0, readp);
+  cueDirectory = options.sCueFilename;
+  cueDirectory = cueDirectory.replace(/([\/\\][^\/\\]*)$/, '');
+  readp = '';
 
-  while (!fdCueFile.eof()) {
-    const sLine = fdCueFile.fgets(256);
-    if (!sLine) {
-      if (fdCueFile.eof()) break;
-      console.error('bin2iso(fgets)');
-      console.log('Error reading cuefile\n');
-      process.exit(1);
-    }
-
-    currenttrack = ParseCueLine(sLine, currentfile, currenttrack);
+  const lines = fdCueFile.split(/\r?\n/); // Handles Windows (\r\n) and Unix (\n) newlines
+  activefile = currentfile;
+  for (const line of lines) {
+    currenttrack = ParseCueLine(line, currenttrack);
   }
 
   if (nTracks == 0) {
@@ -819,7 +791,7 @@ function ParseCue() {
     exit(1);
   }
 
-  fclose(fdCueFile);
+  // fdCueFile.close();
 }
 
 // Returns false when no data found, true when there is.
@@ -886,7 +858,7 @@ function IsoFromCue() {
   // Since sector sizes may vary from track to track, have to calculate the byte offset for
   // each track in a file incrementally. This assumes each FILE is only declared once in the
   // cuefile, and TRACKs are in strictly ascending order.
-  const trackofs = 0; // off_t trackofs = 0;
+  let trackofs = 0; // off_t trackofs = 0;
   for (i = 0; i < nTracks; i++) {
     tracks[i].startOfs = trackofs;
 
@@ -929,12 +901,12 @@ function IsoFromCue() {
       const filesize = GetFileSize(tracks[i].fdSrcFile); // off_t
       const trackbytes = filesize - trackofs; // off_t
       if (trackbytes < 0) {
-        console.log('Error: Track %d Index1 past file end\n', tracks[i].num);
+        console.log('Error: Track %d Index1 past file end', tracks[i].num);
         return;
       }
       if (trackbytes % tracks[i].sectorSize != 0)
         console.log(
-          'Warning: Track %d bytesize %lu not divisible by its sector size %u\n',
+          'Warning: Track %d bytesize %lu not divisible by its sector size %u',
           tracks[i].num,
           trackbytes,
           tracks[i].sectorSize
@@ -945,7 +917,7 @@ function IsoFromCue() {
     } else {
       if (tracks[i].idx1 > tracks[i + 1].idx0) {
         console.log(
-          "Error: Track %d Index1 past next track's Index0\n",
+          "Error: Track %d Index1 past next track's Index0",
           tracks[i].num
         );
         return;
@@ -971,17 +943,12 @@ function IsoFromCue() {
     }
   }
 
-  console.log('\n');
   for (i = 0; i <= nTracks - 1; i++) {
     const tracksize = tracks[i].totalSectors * tracks[i].sectorSize; // uint32_t
     console.log(
-      '%s (%d Mb) - sectors %06ld:%06ld (offset %09ld:%09ld)\n',
-      tracks[i].name,
-      tracksize >> 20,
-      tracks[i].idx1,
-      tracks[i].idx1 + tracks[i].totalSectors - 1,
-      tracks[i].startOfs,
-      tracks[i].startOfs + tracksize - 1
+      `${tracks[i].name} (${tracksize >> 20} Mb) - sectors ${tracks[i].idx1}:${
+        tracks[i].idx1 + tracks[i].totalSectors - 1
+      } (offset ${tracks[i].startOfs}:${tracks[i].startOfs + tracksize - 1})`
     );
   }
   console.log('\n');
