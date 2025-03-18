@@ -371,7 +371,7 @@ function FlushBuffers(fdBinFile) {
 }
 
 function DoTrack(track) {
-  let fdBinFile = track.fdSrcFile;
+  // let fdBinFile = track.fdSrcFile;
   let buffer; // this is a pointer to somewhere in inBuf, for zero-copy reads
   let remainingsectors = track.totalSectors;
 
@@ -417,8 +417,12 @@ function DoTrack(track) {
   console.log('): ');
   let datasize = track.sectorSize - track.predata - track.postdata;
 
-  fdOutFile = fopen(sOutFilename, 'wb');
-  if (fdOutFile == NULL) {
+  // TODO:
+  // sOutFilename -> './TEST-01.iso'
+  console.error('OPENING: ', sOutFilename);
+  // fdOutFile = fs.openSync(sOutFilename, 'w');
+  const fdOutFile = fs.createWriteStream(sOutFilename);
+  if (fdOutFile == null) {
     perror('bin2iso(fopen)');
     console.log('Unable to create "%s"\n', sOutFilename);
     exit(1);
@@ -466,23 +470,66 @@ function DoTrack(track) {
     }
   }
 
-  if (0 !== fs.seekSync(fdBinFile, track.startOfs, 'SET')) {
-    console.error('bin2iso(fseek)');
+  console.error('START:   ', track.startOfs);
+  const fdBinFile = fs.createReadStream('TEST/TEST.bin', {
+    start: track.startOfs,
+  });
+  let bytesWritten = 0;
+  // Setup buffering and writing
+  fdBinFile.on('data', (chunk) => {
+    // Append the chunk data to our internal buffer
+    let remaining = chunk.length;
+    let readStart = 0;
+
+    while (remaining > 0) {
+      // If we need to refill the buffer
+      if (inBufReadIndex >= inBufWriteIndex) {
+        // Refill buffer with new data from the file stream
+        chunk.copy(
+          inBuf,
+          0,
+          readStart,
+          readStart + Math.min(inBuf.length, remaining)
+        );
+        inBufWriteIndex = Math.min(inBuf.length, remaining);
+        inBufReadIndex = 0;
+        readStart += inBufWriteIndex;
+        remaining -= inBufWriteIndex;
+      }
+
+      // Prepare the data to write (take care of predata/postdata)
+      const dataToWrite = inBuf.slice(
+        inBufReadIndex + track.predata,
+        inBufReadIndex + track.sectorSize - track.postdata
+      );
+      fdOutFile.write(dataToWrite);
+      bytesWritten += dataToWrite.length;
+
+      inBufReadIndex += track.sectorSize; // Move the read index forward
+    }
+  });
+
+  fdBinFile.on('end', () => {
+    console.error(bytesWritten, datasize);
+    console.log('File write completed');
+    fdOutFile.end();
+  });
+
+  fdBinFile.on('error', (err) => {
+    console.error(`Error reading bin file: ${err}`);
     process.exit(1);
-  }
+  });
 
-  while (
-    remainingsectors-- !== 0 &&
-    BufferedFRead(buffer, track.sectorSize, fdBinFile)
-  ) {
-    BufferedFWrite(buffer.slice(track.predata), datasize, fdBinFile);
-  }
+  fdOutFile.on('error', (err) => {
+    console.error(`Error writing to iso file: ${err}`);
+    process.exit(1);
+  });
 
-  FlushBuffers(fdBinFile);
-  console.log('OK');
+  // FlushBuffers(fdBinFile);
+  // console.log('OK');
 
-  fs.closeSync(fdOutFile);
-  fs.closeSync(fdBinFile);
+  // fs.closeSync(fdOutFile);
+  // fs.closeSync(fdBinFile);
 }
 
 // TODO THIS WHOLE FUNCTION
@@ -591,18 +638,29 @@ function ParseCueLine(readp, track) {
     track.fdSrcFile = OpenCaseless(activefile);
 
     // Read the index number straight into track.num, use numstr to refer back to this index.
-    let numstr = readp;
-    track.num = 0;
-    while (readp.charAt(0) >= '0' && readp.charAt(0) <= '9') {
-      track.num = track.num * 10 + (parseInt(readp.charAt(0)) - parseInt('0'));
-      readp = readp.slice(1);
-    }
-    readp = '\0' + readp.slice(1); // numstr terminator
-    // while (readp.charAt(0) === ' ') {
+    // ? This may or may not be right
+    // let numstr = readp;
+    // console.error('numstr: ', numstr);
+    // track.num = 0;
+    // while (readp.charAt(0) >= '0' && readp.charAt(0) <= '9') {
+    //   track.num = track.num * 10 + (parseInt(readp.charAt(0)) - parseInt('0'));
     //   readp = readp.slice(1);
     // }
-    readp = readp.replace(/^\0+/, ''); // Remove any leading null characters
-    readp = readp.replace(/^\s+/, ''); // Remove leading spaces and other whitespace characters
+    // readp = '\0' + readp.slice(1); // numstr terminator
+    // readp = readp.replace(/^\0+/, ''); // Remove any leading null characters
+    // readp = readp.replace(/^\s+/, ''); // Remove leading spaces and other whitespace characters
+    // console.error('numstr: ', readp);
+    track.num = 0;
+    while (readp.length > 0 && readp[0] >= '0' && readp[0] <= '9') {
+      track.num = track.num * 10 + (readp[0] - '0');
+      readp = readp.slice(1); // Move to the next character
+    }
+    // Now, readp is updated, and we have extracted the number into track.num.
+    // Skip over any spaces.
+    while (readp.length > 0 && readp[0] === ' ') {
+      readp = readp.slice(1); // Remove the space from the beginning of readp
+    }
+    let numstr = track.num;
 
     // Regarding modes - https://en.wikipedia.org/wiki/CD-ROM
     // CD sectors always contains 2352 bytes. Depending on mode, part of that space is used
@@ -967,8 +1025,8 @@ function IsoFromCue() {
     if (!options.doOneTrack || tracks[i].num == options.oneTrackNum)
       DoTrack(tracks[i]);
 
+    const BONK = 0;
     if (BONK == 1) {
-      //#if (BONK == 1)
       const trackA = tracks[i]; // tTrack
       const trackB = tracks[i + 1]; // tTrack
 
