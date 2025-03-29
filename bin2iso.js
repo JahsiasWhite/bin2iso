@@ -1,4 +1,4 @@
-const VERSIONSTR = 'V2.0';
+const fs = require('fs');
 
 //----------------Wave Stuff---------------------/
 class WavHdr {
@@ -17,11 +17,10 @@ class WavHdr {
     this.dataTxt = new Uint8Array(4);
     this.blockSize = 0;
   }
-}
+} //tWavHead
 
 const HEADBYTES = 36;
 const WINDOWS_PCM = 0x0001;
-
 //-------------------------------------------------/
 
 const MAXIMUM_TRACK_NUMBERS = 100;
@@ -51,6 +50,7 @@ const udfVolumeDescriptor = new Uint8Array([
   0x00,
 ]); // DVDs
 
+// #pragma pack(push, 1) // tell compiler not to add alignment padding here
 class IsoHdr {
   constructor() {
     this.type = 0;
@@ -67,7 +67,8 @@ class IsoHdr {
     this.logicalBlockSizeMSB = 0;
     this.moreStuff = new Uint8Array(1916);
   }
-}
+} // tIsoDescriptor
+// #pragma pack(pop)
 
 // Bin2iso internal track modes.
 const MODE_AUDIO = 0;
@@ -82,7 +83,7 @@ const MODE2_2448 = 70;
 // got this from easycd pro by looking at a blank disk so it may be off...
 const CD74_MAX_SECTORS = 334873; // 653.75 Mb
 
-class CommandlineOptions {
+class options {
   constructor() {
     this.oneTrackNum = 0;
     this.splitRmsLimit = 0;
@@ -94,17 +95,18 @@ class CommandlineOptions {
     this.createCue = false;
     this.doOneTrack = false;
     this.doInPlace = false;
-    this.outputDir = '';
+    this.outputFile = '';
     this.sBinFilename = '';
     this.sCueFilename = '';
   }
 }
 
 // global variables
+// FILE * fdOutFile;
 let fdOutFile;
 let cueDirectory = '';
+const VERSIONSTR = '1.0.1';
 
-// FROM bunnylin:
 // Best buffer size varies by machine, 1-4Mb generally best. 2Mb write worked best on my machine.
 // I also tried doing direct fwrites instead of buffering, but that was slightly slower somehow.
 // There are cache buffers at hardware, OS, clib implementation, and CPU level, so it's not useful
@@ -134,94 +136,430 @@ class Track {
     this.sSrcFileName = '';
     this.name = ''; // srcfilename + "-xx.ext"
   }
-}
+} // tTrack
 
 const tracks = new Array(MAXIMUM_TRACK_NUMBERS)
   .fill(null)
   .map(() => new Track());
 let nTracks = 0;
 
-/**
- * ! This function doesn't exist in bin2iso.c
- * I want this to be able to used on node or just the browser
- * @param {*} filename
- * @returns
- */
-function openCueFile(filename) {
-  if (typeof window !== 'undefined') {
-    console.log('Running in browser – use a file input instead.');
-  } else {
-    const fs = require('fs');
+function strcpylower(out_str, in_str) {
+  let i = 0;
+  while (in_str[i] !== undefined) {
+    out_str[i] = in_str[i].toLowerCase();
+    i++;
+  }
+  out_str[i] = '';
+}
+
+// TODO
+// function GetFileSize(file) {
+//   if (file.seek(0, 'end') !== 0) {
+//     console.error('bin2iso(fseek)');
+//     process.exit(1);
+//   }
+//   return file.tell();
+// }
+function GetFileSize(file) {
+  // Open the file for reading
+  try {
+    const stats = fs.statSync('TEST/TEST.bin');
+    return stats.size;
+  } catch (err) {
+    console.error('Error getting file stats:', err);
+    process.exit(1);
+  }
+}
+
+function OpenCaseless(filename) {
+  // If using a CUE file outside the current working directory, presumably BIN files are next
+  // to the CUE so go to that directory temporarily.
+  const cwd = process.cwd();
+  if (cueDirectory.length > 0) {
     try {
-      fs.accessSync(filename, fs.constants.R_OK);
-      console.log(`File "${filename}" is accessible.`);
-      return true;
+      process.chdir(cueDirectory);
     } catch (err) {
-      console.error(`Error: Unable to open "${filename}"`, err);
+      console.error('bin2iso(chdir)', err);
       process.exit(1);
+    }
+  }
+
+  const filemode = options.doInPlace ? 'r+' : 'r';
+  let fd = null;
+
+  try {
+    // fd = fs.openSync(filename, filemode);
+    fd = fs.readFileSync(filename, 'utf8');
+  } catch (err) {
+    // If not found at exact casing, look for a variant-case file.
+    const dir = fs.opendirSync('.');
+    const namelen = filename.length;
+    const lowname = filename.toLowerCase();
+
+    let entry;
+    while ((entry = dir.readSync()) !== null) {
+      const entrylen = entry.name.length;
+      if (entrylen !== namelen) continue;
+      const newname = entry.name.toLowerCase();
+      if (lowname === newname) {
+        try {
+          fd = fs.openSync(entry.name, filemode);
+          break;
+        } catch (err) {
+          // Ignore error and continue searching
+        }
+      }
+    }
+    dir.closeSync();
+
+    if (fd === null) {
+      console.error('bin2iso(fopen)');
+      console.log(`Error: Unable to open "${filename}"`);
+      process.exit(1);
+    }
+  }
+
+  if (cueDirectory !== '') {
+    try {
+      process.chdir(cwd);
+    } catch (err) {
+      console.error('bin2iso(chdir)', err);
+      process.exit(1);
+    }
+  }
+
+  return fd;
+}
+
+// The INDEX mm:ss:ff values point at a sector index denominated in a way friendly to CD audio.
+// There are 75 frames to one second.
+// 44100 Hz 16-bit stereo audio uses 44100 * 2 * 2 = 176400 bytes per second.
+// Therefore the raw sector size per frame is 176400 / 75 = 2352 bytes.
+// Example: time index 00:02:50
+//   2 * 75 + 50 = sector index 200
+//   2352 * 200 = byte offset 470400
+
+function SectorIndex(m, s, f) {
+  let temp;
+
+  temp = ((m >> 4) * 10 + (m & 0xf)) * 60;
+  temp = (temp + ((s >> 4) * 10 + (s & 0xf))) * 75;
+  temp = temp + ((f >> 4) * 10 + (f & 0xf));
+
+  //console.log("\n%d%d %d%d %d%d = %06d", m >> 4, m & f, s >> 4, s & f, f >> 4, f & f, temp);
+  return temp;
+}
+
+function TimeIndex(sectorindex, ptr) {
+  let m, s, f;
+
+  f = uint8_t(sectorindex % 75);
+  s = uint8_t((sectorindex / 75) % 60);
+  m = uint8_t(sectorindex / (75 * 60));
+  sconsole.log(
+    ptr,
+    '%d%d:%d%d:%d%d',
+    m / 10,
+    m % 10,
+    s / 10,
+    s % 10,
+    f / 10,
+    f % 10
+  );
+}
+
+function BufferedFRead(readptr, readsize, srcfile) {
+  if (inBufReadIndex >= inBufWriteIndex) {
+    // No more unread data in buffer, get more from file.
+    inBufWriteIndex = srcfile.read(
+      inBuf,
+      0,
+      INBUF_SIZE - (INBUF_SIZE % readsize)
+    );
+    if (inBufWriteIndex === 0) {
+      return false; // read failed, or end of file
+    }
+    inBufReadIndex = 0;
+  }
+
+  readptr[0] = inBuf.slice(inBufReadIndex);
+
+  inBufReadIndex += readsize;
+  if (inBufReadIndex > inBufWriteIndex) {
+    console.warn('Warning: Premature EOF');
+    inBuf.fill(0, inBufWriteIndex, inBufReadIndex);
+  }
+
+  return true; // read passed
+}
+
+function BufferedFWrite(srcptr, size, fdBinFile) {
+  // Assert: size is always less than OUTBUF_SIZE.
+  if (outBufIndex + size > OUTBUF_SIZE) {
+    let readpos = 0;
+    if (fdOutFile === fdBinFile) {
+      // reading and writing same file in place
+      readpos = fdOutFile.tell(); // Assuming fdOutFile is a file-like object with a tell method
+      if (fdOutFile.seek(writePos) !== 0) {
+        console.error('\nbin2iso(fseek)');
+        process.exit(1);
+      }
+    }
+
+    if (fdOutFile.write(outBuf.slice(0, outBufIndex)) !== 1) {
+      console.error('\nbin2iso(fwrite)');
+      fdOutFile.close();
+      process.exit(1);
+    }
+    outBufIndex = 0;
+
+    if (fdOutFile === fdBinFile) {
+      writePos = fdOutFile.tell();
+      if (fdOutFile.seek(readpos) !== 0) {
+        console.error('\nbin2iso(fseek)');
+        process.exit(1);
+      }
+    }
+  }
+
+  outBuf.set(
+    new Uint8Array(srcptr.buffer, srcptr.byteOffset, size),
+    outBufIndex
+  );
+  outBufIndex += size;
+}
+
+function FlushBuffers(fdBinFile) {
+  let readpos = 0;
+
+  if (fdOutFile == fdBinFile) {
+    // reading and writing same file in place
+    readpos = ftell(fdOutFile);
+    if (0 != fseek(fdOutFile, writePos, SEEK_SET)) {
+      perror('\nbin2iso(fseek)');
+      exit(1);
+    }
+  }
+
+  if (outBufIndex != 0 && 1 != fwrite(outBuf, outBufIndex, 1, fdOutFile)) {
+    perror('\nbin2iso(fwrite)');
+    fclose(fdOutFile);
+    exit(1);
+  }
+
+  outBufIndex = 0;
+  inBufReadIndex = 0;
+  inBufWriteIndex = 0;
+
+  if (fdOutFile == fdBinFile) {
+    writePos = ftell(fdOutFile);
+    if (0 != fseek(fdOutFile, readpos, SEEK_SET)) {
+      perror('\nbin2iso(fseek)');
+      exit(1);
     }
   }
 }
 
-// tTrack* ParseCueLine(char* readp, char* activefile, tTrack* track)
-function ParseCueLine(readp, activefile, track) {
+function DoTrack(track) {
+  // let fdBinFile = track.fdSrcFile;
+  let remainingsectors = track.totalSectors;
+
+  let sOutFilename;
+  // strcpy(sOutFilename, options.outputDir);
+  // strcat(sOutFilename, track.name);
+
+  // sOutFilename = options.outputDir + track.name;
+  sOutFilename = options.outputFile;
+
+  // In 2352-byte modes, there's some metadata in each sector that needs to be skipped when
+  // copying the user data.
+  // See: https://en.wikipedia.org/wiki/CD-ROM
+  // In 2048-byte mode, all metadata is already omitted, copy to output directly.
+  // Mode2/2336 is special: this is Mode2/Form1 except the first 16 bytes are omitted. This
+  // means the sync pattern is not present, but the subheader and ECC stuff is there. Sectors
+  // are saved as 2336 bytes each, including the usual 2048 bytes of user data.
+  switch (track.mode) {
+    case MODE_AUDIO:
+      console.log('Audio');
+      break;
+    case MODE_AUDIOSUB:
+      console.log('Audio with subchannel data');
+      break;
+    case MODE1_2352:
+      console.log('Using Mode1/2352');
+      break;
+    case MODE1_2048:
+      console.log('Using Mode1/2048');
+      break;
+    case MODE1_2448:
+      console.log('Using Mode1/2448');
+      break;
+    case MODE2_2352:
+      console.log('Using Mode2/2352');
+      break;
+    case MODE2_2336:
+      console.log('Using Mode2/2336');
+      break;
+    default:
+      console.log('Unexpected mode!');
+      exit(1);
+  }
+  let datasize = track.sectorSize - track.predata - track.postdata;
+
+  // TODO:
+  // sOutFilename -> './TEST-01.iso'
+  // fdOutFile = fs.openSync(sOutFilename, 'w');
+  const fdOutFile = fs.createWriteStream(sOutFilename);
+  if (fdOutFile == null) {
+    perror('bin2iso(fopen)');
+    console.log('Unable to create "%s"\n', sOutFilename);
+    exit(1);
+  }
+
+  if (track.mode == MODE_AUDIO || track.mode == MODE_AUDIOSUB) {
+    let totalsize = track.totalSectors * SIZERAW;
+    // let wavhead =
+    // {
+    // 	"RIFF",
+    // 	totalsize + HEADBYTES, // bytesToEnd
+    // 	"WAVE",
+    // 	"fmt ",
+    // 	16,          // 16 byte format specifier
+    // 	WINDOWS_PCM, // format
+    // 	2,           // 2 Channels
+    // 	44100,       // 44,100 Samples/sec
+    // 	176400,      // 176,400 Bytes/sec
+    // 	4,           // 4 bytes/sample
+    // 	16,          // 16 bits/channel
+    // 	"data",
+    // 	totalsize
+    // };
+    // TODO
+    const wavhead = {
+      chunkID: 'RIFF',
+      chunkSize: totalsize + HEADBYTES, // bytesToEnd
+      format: 'WAVE',
+      subchunk1ID: 'fmt ',
+      subchunk1Size: 16, // 16 byte format specifier
+      audioFormat: WINDOWS_PCM, // format
+      numChannels: 2, // 2 Channels
+      sampleRate: 44100, // 44,100 Samples/sec
+      byteRate: 176400, // 176,400 Bytes/sec
+      blockAlign: 4, // 4 bytes/sample
+      bitsPerSample: 16, // 16 bits/channel
+      subchunk2ID: 'data',
+      subchunk2Size: totalsize,
+    };
+
+    if (1 !== fs.writeSync(fdOutFile, wavhead)) {
+      console.error('bin2iso(fwrite)');
+      fs.closeSync(fdOutFile);
+      process.exit(1);
+    }
+  }
+
+  const fdBinFile = fs.createReadStream('TEST/TEST.bin', {
+    start: track.startOfs,
+  });
+  let bytesWritten = 0;
+  // Setup buffering and writing
+  let buffer = Buffer.alloc(0); // this is a pointer to somewhere in inBuf, for zero-copy reads
+  fdBinFile.on('data', (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]); // accumulate
+
+    while (buffer.length >= track.sectorSize) {
+      const sector = buffer.slice(0, track.sectorSize); // extract full sector
+
+      const dataToWrite = sector.slice(
+        track.predata,
+        track.sectorSize - track.postdata
+      );
+
+      fdOutFile.write(dataToWrite);
+      bytesWritten += dataToWrite.length;
+
+      buffer = buffer.slice(track.sectorSize); // remove processed sector
+    }
+  });
+
+  fdBinFile.on('end', () => {
+    console.log('File write completed');
+    fdOutFile.end();
+  });
+
+  fdBinFile.on('error', (err) => {
+    console.error(`Error reading bin file: ${err}`);
+    process.exit(1);
+  });
+
+  fdOutFile.on('error', (err) => {
+    console.error(`Error writing to iso file: ${err}`);
+    process.exit(1);
+  });
+
+  // FlushBuffers(fdBinFile);
+  // console.log('OK');
+
+  // fs.closeSync(fdOutFile);
+  // fs.closeSync(fdBinFile);
+}
+
+// TODO THIS WHOLE FUNCTION
+function ParseCueLine(readp, track) {
   // For reference:
   // https://www.gnu.org/software/ccd2cue/manual/html_node/CUE-sheet-format.html#CUE-sheet-format
   // https://kodi.wiki/view/Cue_sheets
 
   // Skip leading spaces. Usually there's an exact amount of whitespace for each command, but
   // some CUE file generators produce fewer or more spaces. Should skip tab too?..
-  while (readp == ' ' || readp == '\n' || readp == '\r') readp++;
-  if (readp == '\0') return track; // empty line
+  while (readp[0] === ' ' || readp[0] === '\n' || readp[0] === '\r') {
+    readp = readp.slice(1); // Move forward (equivalent to readp++)
+  }
+  if (readp.length === 0) return track; // empty line
 
   // FILE "<filename>" <MODE>
   // The filename might include an absolute or relative directory, but usually is just the file.
   // Filename is usually in quotes, but they can be omitted if it has no spaces.
   // Mode is usually BINARY, but could be WAVE, AIFF, MP3. Also MOTOROLA for big-endian binary.
   // We only want the filename, ignore the mode.
-  if (strncmp(readp, 'FILE ', 5) == 0) {
-    readp += 5;
-    while (readp == ' ') readp++; // just in case
+  if (readp.startsWith('FILE ')) {
+    readp = readp.slice(5); // Skip "FILE "
+    while (readp[0] == ' ') readp = readp.slice(1); // just in case
 
-    const writep = activefile;
-    const terminator = ' ';
+    let writep = activefile;
+    let terminator = ' ';
 
-    while (readp != '\0' && readp != terminator) {
-      switch (readp) {
-        // case 1 ... 31:
-        case 1:
-        case 2:
-        case 3:
-          // Ignore unexpected control characters silently.
+    while (readp.length > 0 && readp[0] !== terminator) {
+      let char = readp[0];
+
+      switch (true) {
+        case char.charCodeAt(0) >= 1 && char.charCodeAt(0) <= 31:
+          // Ignore unexpected control characters silently
           break;
 
-        case '/':
-        case '\\':
-          // Just ignore anything to the left of every path separator.
-          // Technically incorrect, but directory references in CUE files are invalid
-          // more often than not...
-          writep = activefile;
+        case char === '/' || char === '\\':
+          // Ignore anything to the left of a path separator
+          writep = '';
           break;
 
-        case '"':
+        case char === '"':
           terminator = '"';
           break;
 
         default:
-          // *(writep++) = *readp;
-          writep += readp; // Appends the character to writep
+          writep += char;
           break;
       }
 
-      readp++;
+      readp = readp.slice(1); // Move pointer forward (like readp++)
     }
 
-    if (terminator == '"' && readp != '"') {
+    if (terminator == '"' && readp[0] != '"') {
       console.log(
         "Error: Unpaired \" in 'FILE' in cuefile %s\n",
         options.sCueFilename
       );
-      return;
+      exit(1);
     }
 
     if (writep == activefile) {
@@ -229,10 +567,11 @@ function ParseCueLine(readp, activefile, track) {
         "Error: Empty name for 'FILE' in cuefile %s\n",
         options.sCueFilename
       );
-      return;
+      exit(1);
     }
-    writep = '\0';
-    track = NULL;
+    // *writep = '\0';
+    activefile = writep;
+    track = null;
   }
 
   // TRACK <number> <DATATYPE>
@@ -240,16 +579,17 @@ function ParseCueLine(readp, activefile, track) {
   // The number doesn't have to have a leading 0. It should grow by +1 for each new track.
   // The track's source FILE context must have appeared already.
   // DATATYPE is AUDIO or one of several binary data descriptors.
-  else if (strncmp(readp, 'TRACK ', 6) == 0) {
-    readp += 6;
-    while (readp == ' ') readp++;
+  else if (readp.startsWith('TRACK ')) {
+    readp = readp.slice(6);
+    // while (*readp == ' ') readp++;
+    while (readp[0] === ' ') readp++;
 
     if (nTracks >= MAXIMUM_TRACK_NUMBERS) {
       console.log(
         'Error: Too many tracks in cuefile %s\n',
         options.sCueFilename
       );
-      return;
+      exit(1);
     }
 
     track = tracks[nTracks++];
@@ -259,28 +599,40 @@ function ParseCueLine(readp, activefile, track) {
     track.predata = 0;
     track.postdata = 0;
 
-    if (activefile[0] == '\0') {
+    if (activefile.length === 0) {
       console.log(
         'Error: TRACK before FILE in cuefile %s\n',
         options.sCueFilename
       );
-      return;
+      process.exit(1);
     }
-    strcpy(track.sSrcFileName, activefile);
+    track.sSrcFileName = activefile;
     track.fdSrcFile = OpenCaseless(activefile);
 
     // Read the index number straight into track.num, use numstr to refer back to this index.
-    const numstr = readp;
+    // ? This may or may not be right
+    // let numstr = readp;
+    // console.error('numstr: ', numstr);
+    // track.num = 0;
+    // while (readp.charAt(0) >= '0' && readp.charAt(0) <= '9') {
+    //   track.num = track.num * 10 + (parseInt(readp.charAt(0)) - parseInt('0'));
+    //   readp = readp.slice(1);
+    // }
+    // readp = '\0' + readp.slice(1); // numstr terminator
+    // readp = readp.replace(/^\0+/, ''); // Remove any leading null characters
+    // readp = readp.replace(/^\s+/, ''); // Remove leading spaces and other whitespace characters
+    // console.error('numstr: ', readp);
     track.num = 0;
-    // TODO
-    // while (*readp >= '0' && *readp <= '9')
-    // 	track.num = track.num * 10 + (*(readp++) - '0');
-    // *(readp++) = '\0'; // numstr terminator
-    // while (*readp == ' ') readp++;
-    while (readp >= '0' && readp <= '9')
-      track.num = track.num * 10 + (readp++ - '0');
-    readp = '\0';
-    while (readp == ' ') readp++;
+    while (readp.length > 0 && readp[0] >= '0' && readp[0] <= '9') {
+      track.num = track.num * 10 + (readp[0] - '0');
+      readp = readp.slice(1); // Move to the next character
+    }
+    // Now, readp is updated, and we have extracted the number into track.num.
+    // Skip over any spaces.
+    while (readp.length > 0 && readp[0] === ' ') {
+      readp = readp.slice(1); // Remove the space from the beginning of readp
+    }
+    let numstr = track.num;
 
     // Regarding modes - https://en.wikipedia.org/wiki/CD-ROM
     // CD sectors always contains 2352 bytes. Depending on mode, part of that space is used
@@ -288,17 +640,17 @@ function ParseCueLine(readp, activefile, track) {
     // for any track, the sector index is always multiplied by 2352.
     // However, a disk image may be saved with an unusual sector size, omitting part of the
     // physical 2352 bytes, or including subchannel data to go above 2352 bytes.
-    if (strncmp(readp, 'AUDIO/', 6) == 0) track.mode = MODE_AUDIOSUB;
-    else if (strncmp(readp, 'AUDIO', 5) == 0) track.mode = MODE_AUDIO;
-    else if (strncmp(readp, 'MODE1/2352', 10) == 0) track.mode = MODE1_2352;
-    else if (strncmp(readp, 'MODE1/2048', 10) == 0) track.mode = MODE1_2048;
-    else if (strncmp(readp, 'MODE1/2448', 10) == 0) track.mode = MODE1_2448;
-    else if (strncmp(readp, 'MODE2/2352', 10) == 0) track.mode = MODE2_2352;
-    else if (strncmp(readp, 'MODE2/2336', 10) == 0) track.mode = MODE2_2336;
-    else if (strncmp(readp, 'MODE2/2448', 10) == 0) track.mode = MODE2_2448;
+    if (readp.startsWith('AUDIO/')) track.mode = MODE_AUDIOSUB;
+    else if (readp.startsWith('AUDIO')) track.mode = MODE_AUDIO;
+    else if (readp.startsWith('MODE1/2352')) track.mode = MODE1_2352;
+    else if (readp.startsWith('MODE1/2048')) track.mode = MODE1_2048;
+    else if (readp.startsWith('MODE1/2448')) track.mode = MODE1_2448;
+    else if (readp.startsWith('MODE2/2352')) track.mode = MODE2_2352;
+    else if (readp.startsWith('MODE2/2336')) track.mode = MODE2_2336;
+    else if (readp.startsWith('MODE2/2448')) track.mode = MODE2_2448;
     else {
       console.log('Error: Track %s - Unknown mode: [%s]\n', numstr, readp);
-      return;
+      process.exit(1);
     }
 
     switch (track.mode) {
@@ -336,15 +688,19 @@ function ParseCueLine(readp, activefile, track) {
     }
 
     // Build the name: <source file without extension>-<track index>.<wav or iso>
-    strcpy(track.name, track.sSrcFileName);
-    const extp = strrchr(track.name, '.'); // char*
-    if (extp != NULL) extp = '\0';
-    strcat(track.name, '-');
-    strcat(track.name, numstr);
+    track.name = track.sSrcFileName;
+    let extp = track.name.lastIndexOf('.');
+    if (extp !== -1) {
+      track.name = track.name.substring(0, extp);
+    }
+    track.name += '-';
+    track.name += numstr;
 
-    if (track.mode == MODE_AUDIO || track.mode == MODE_AUDIOSUB)
-      strcat(track.name, '.wav');
-    else strcat(track.name, '.iso');
+    if (track.mode === 'MODE_AUDIO' || track.mode === 'MODE_AUDIOSUB') {
+      track.name += '.wav';
+    } else {
+      track.name += '.iso';
+    }
   }
 
   // INDEX <number> <mm:ss:ff>
@@ -353,37 +709,43 @@ function ParseCueLine(readp, activefile, track) {
   // The index's source TRACK context must have appeared already.
   // The time value is a time-encoded offset relative to the start of the FILE, which converts
   // to a sector index.
-  else if (strncmp(readp, 'INDEX ', 6) == 0) {
-    readp += 6;
-    while (readp == ' ') readp++;
+  else if (readp.startsWith('INDEX ')) {
+    readp = readp.slice(6);
+    while (readp.charAt(0) === ' ') readp = readp.slice(1);
 
-    if (track == NULL) {
+    if (track == null) {
       console.log(
         'Error: INDEX without active TRACK cuefile %s\n',
         options.sCueFilename
       );
-      return;
+      exit(1);
     }
 
-    const numstr = readp; // char*
-    const i = 0; // int32_t
-    // TODO
-    // while (*readp >= '0' && *readp <= '9')
-    // 	i = i * 10 + (*(readp++) - '0');
-    while (readp >= '0' && readp <= '9') i = i * 10 + (readp++ - '0');
+    let numstr = readp;
+    let i = 0;
+    while (readp.charAt(0) >= '0' && readp.charAt(0) <= '9') {
+      i = i * 10 + (readp.charCodeAt(0) - '0'.charCodeAt(0));
+      readp = readp.slice(1);
+    }
 
     if (i >= 2) {
       readp = '\0';
       console.log('Error: Unexpected INDEX number: %s\n', numstr);
       // Maybe should just warn, return, and keep going?
-      return;
+      exit(1);
     }
 
-    while (readp == ' ') readp++;
+    while (readp.charAt(0) === ' ') readp = readp.slice(1);
 
-    const min = ((readp[0] - '0') << 4) | (readp[1] - '0'); // char
-    const sec = ((readp[3] - '0') << 4) | (readp[4] - '0'); // char
-    const frame = ((readp[6] - '0') << 4) | (readp[7] - '0'); // char
+    let min =
+      ((readp.charCodeAt(0) - '0'.charCodeAt(0)) << 4) |
+      (readp.charCodeAt(1) - '0'.charCodeAt(0));
+    let sec =
+      ((readp.charCodeAt(3) - '0'.charCodeAt(0)) << 4) |
+      (readp.charCodeAt(4) - '0'.charCodeAt(0));
+    let frame =
+      ((readp.charCodeAt(6) - '0'.charCodeAt(0)) << 4) |
+      (readp.charCodeAt(7) - '0'.charCodeAt(0));
 
     if (i == 0) {
       if (track.mode != MODE_AUDIO && track.mode != MODE_AUDIOSUB) {
@@ -391,7 +753,7 @@ function ParseCueLine(readp, activefile, track) {
           'Error: Index 0 pregap defined on non-audio track %d\n',
           track.num
         );
-        return;
+        exit(1);
       }
       track.idx0 = SectorIndex(min, sec, frame);
       if (track.idx1 == -1) track.idx1 = track.idx0;
@@ -403,18 +765,18 @@ function ParseCueLine(readp, activefile, track) {
 
   // The pre- and postgap commands supposedly are there to request an artificial gap be added,
   // which is not actually in the source data. Let's ignore those...
-  else if (strncmp(readp, 'PREGAP ', 7) == 0) {
-  } else if (strncmp(readp, 'POSTGAP ', 8) == 0) {
+  else if (readp.startsWith('PREGAP ')) {
+  } else if (readp.startsWith('POSTGAP ')) {
   }
   // Other functionally uninteresting commands, ignore.
-  else if (strncmp(readp, 'CDTEXTFILE ', 11) == 0) {
-  } else if (strncmp(readp, 'SONGWRITER ', 11) == 0) {
-  } else if (strncmp(readp, 'PERFORMER ', 10) == 0) {
-  } else if (strncmp(readp, 'CATALOG ', 8) == 0) {
-  } else if (strncmp(readp, 'FLAGS ', 6) == 0) {
-  } else if (strncmp(readp, 'TITLE ', 6) == 0) {
-  } else if (strncmp(readp, 'ISRC ', 5) == 0) {
-  } else if (strncmp(readp, 'REM ', 4) == 0) {
+  else if (readp.startsWith('CDTEXTFILE ')) {
+  } else if (readp.startsWith('SONGWRITER ')) {
+  } else if (readp.startsWith('PERFORMER ')) {
+  } else if (readp.startsWith('CATALOG ')) {
+  } else if (readp.startsWith('FLAGS ')) {
+  } else if (readp.startsWith('TITLE ')) {
+  } else if (readp.startsWith('ISRC ')) {
+  } else if (readp.startsWith('REM ')) {
   } else {
     console.log('Unrecognised line in CUE: "%s"\n', readp);
   }
@@ -423,62 +785,86 @@ function ParseCueLine(readp, activefile, track) {
 }
 
 function ParseCue() {
-  // FILE* fdCueFile = fopen(options.sCueFilename, "r");
-  const fdCueFile = openCueFile(options.sCueFilename);
-  if (fdCueFile == null) {
-    perror('bin2iso(fopen)');
-    console.log('Error: Unable to open "%s"\n', options.sCueFilename);
-    return;
+  let fdCueFile;
+  try {
+    // fdCueFile = fs.openSync(options.sCueFilename, 'r');
+    fdCueFile = fs.readFileSync(options.sCueFilename, 'utf8');
+  } catch (e) {
+    console.error('bin2iso(fopen)');
+    console.log(`Error: Unable to open "${options.sCueFilename}"`);
+    process.exit(1);
+  }
+  if (fdCueFile === null) {
+    console.error('bin2iso(fopen)');
+    console.log(`Error: Unable to open "${options.sCueFilename}"`);
+    process.exit(1);
   }
 
-  const sLine = ''; //char sLine[256];
-  const currentFile = ''; //char currentfile[256] = "";
-  const currenttrack = null; // tTrack*
+  let sLine = '';
+  let currentfile = '';
+  let currenttrack = null;
 
   // Extract directory from cue path, removing final directory separator if present.
   // Known limitation: on Windows, drive-relative paths fail. ("bin2cue X:ab.cue")
-  // TODO
-  // strcpy(cueDirectory, options.sCueFilename);
-  // const readp = cueDirectory + strlen(cueDirectory);
-  // while (readp != cueDirectory && *readp != '/' && *readp != '\\') readp--;
-  // *readp = '\0';
+  cueDirectory = options.sCueFilename;
+  cueDirectory = cueDirectory.replace(/([\/\\][^\/\\]*)$/, '');
+  readp = '';
 
-  /* Read Cue File */
-  // Start processing the lines, similar to the C loop
-  // TODO
-  let index = 0,
-    totalLines = 0;
-  while (index < totalLines) {
-    let sLine = lines[index].trim(); // Similar to fgets and trimming extra spaces
-
-    if (sLine === '') {
-      index++;
-      continue; // Skip empty lines (similar to your C logic where it ignores empty lines)
-    }
-
-    // Simulate the same logic as your C code
-    currentTrack = parseCueLine(sLine, currentFile, currentTrack);
-
-    index++;
+  const lines = fdCueFile.split(/\r?\n/); // Handles Windows (\r\n) and Unix (\n) newlines
+  activefile = currentfile;
+  for (const line of lines) {
+    currenttrack = ParseCueLine(line, currenttrack);
   }
-  // while (!feof(fdCueFile)) {
-  //   if (!fgets(sLine, 256, fdCueFile)) {
-  //     if (feof(fdCueFile)) break;
-  //     perror('bin2iso(fgets)');
-  //     console.log('Error reading cuefile\n');
-  //     return;
-  //   }
-
-  //   currenttrack = ParseCueLine(sLine, currentfile, currenttrack);
-  // }
-  /* End Read Cue File */
 
   if (nTracks == 0) {
     console.log('Error: No TRACKs in cuefile\n');
-    return;
+    exit(1);
   }
 
-  fclose(fdCueFile);
+  // fdCueFile.close();
+}
+
+// Returns false when no data found, true when there is.
+function CheckGaps(track) {
+  //if (track.idx0 == track.idx1) return false; // should never happen
+
+  if (0 != fseek(track.fdSrcFile, track.startOfs, SEEK_SET)) {
+    perror('\nbin2iso(fseek)');
+    exit(1);
+  }
+
+  let buf; // uint8_t buf[track.sectorSize];
+  let nonzerocount = 0;
+  let pregapsectors = track.idx1 - track.idx0;
+  console.error('PREGAPSECTORS: ', pregapsectors);
+  while (pregapsectors-- != 0) {
+    if (0 == fread(buf, track.sectorSize, 1, track.fdSrcFile)) {
+      perror('bin2iso(fread)');
+      exit(1);
+    }
+    // uint32_t* readp = (uint32_t*)buf;
+    // for (off_t k = SIZERAW >> 2; k > 0; k--)
+    // {
+    // 	if (*readp != 0)
+    // 		nonzerocount++;
+    // 	readp++;
+    // }
+    let readp = new Uint32Array(buf);
+    let nonzerocount = 0;
+    for (let k = SIZERAW >> 2; k > 0; k--) {
+      if (readp[k - 1] !== 0) {
+        nonzerocount++;
+      }
+    }
+  }
+  console.log('%u non-zero sample pairs in pregap data: ', nonzerocount);
+  if (nonzerocount > SIZERAW >> 3) {
+    console.log('Save\n');
+    return true;
+  }
+
+  console.log('Discard\n');
+  return false;
 }
 
 function IsoFromCue() {
@@ -503,7 +889,7 @@ function IsoFromCue() {
   // Since sector sizes may vary from track to track, have to calculate the byte offset for
   // each track in a file incrementally. This assumes each FILE is only declared once in the
   // cuefile, and TRACKs are in strictly ascending order.
-  const trackofs = 0; // off_t trackofs = 0;
+  let trackofs = 0; // off_t trackofs = 0;
   for (i = 0; i < nTracks; i++) {
     tracks[i].startOfs = trackofs;
 
@@ -546,12 +932,12 @@ function IsoFromCue() {
       const filesize = GetFileSize(tracks[i].fdSrcFile); // off_t
       const trackbytes = filesize - trackofs; // off_t
       if (trackbytes < 0) {
-        console.log('Error: Track %d Index1 past file end\n', tracks[i].num);
+        console.log('Error: Track %d Index1 past file end', tracks[i].num);
         return;
       }
       if (trackbytes % tracks[i].sectorSize != 0)
         console.log(
-          'Warning: Track %d bytesize %lu not divisible by its sector size %u\n',
+          'Warning: Track %d bytesize %lu not divisible by its sector size %u',
           tracks[i].num,
           trackbytes,
           tracks[i].sectorSize
@@ -562,7 +948,7 @@ function IsoFromCue() {
     } else {
       if (tracks[i].idx1 > tracks[i + 1].idx0) {
         console.log(
-          "Error: Track %d Index1 past next track's Index0\n",
+          "Error: Track %d Index1 past next track's Index0",
           tracks[i].num
         );
         return;
@@ -588,17 +974,12 @@ function IsoFromCue() {
     }
   }
 
-  console.log('\n');
   for (i = 0; i <= nTracks - 1; i++) {
     const tracksize = tracks[i].totalSectors * tracks[i].sectorSize; // uint32_t
     console.log(
-      '%s (%d Mb) - sectors %06ld:%06ld (offset %09ld:%09ld)\n',
-      tracks[i].name,
-      tracksize >> 20,
-      tracks[i].idx1,
-      tracks[i].idx1 + tracks[i].totalSectors - 1,
-      tracks[i].startOfs,
-      tracks[i].startOfs + tracksize - 1
+      `${tracks[i].name} (${tracksize >> 20} Mb) - sectors ${tracks[i].idx1}:${
+        tracks[i].idx1 + tracks[i].totalSectors - 1
+      } (offset ${tracks[i].startOfs}:${tracks[i].startOfs + tracksize - 1})`
     );
   }
   console.log('\n');
@@ -617,8 +998,8 @@ function IsoFromCue() {
     if (!options.doOneTrack || tracks[i].num == options.oneTrackNum)
       DoTrack(tracks[i]);
 
+    const BONK = 0;
     if (BONK == 1) {
-      //#if (BONK == 1)
       const trackA = tracks[i]; // tTrack
       const trackB = tracks[i + 1]; // tTrack
 
@@ -659,18 +1040,328 @@ function IsoFromCue() {
   }
 }
 
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ */
+
+function CheckIsoHeader(buffer, sectorcount) {
+  if (memcmp(buffer, isoVolumeDescriptor, 8) == 0) {
+    header = buffer;
+    console.log(
+      '(System ID: %.32s)\n(Volume ID: %.32s)\n',
+      header.systemId,
+      header.volumeId
+    );
+    console.log(
+      '(ISO track size: %d blocks * %d bytes)\n',
+      header.volumeBlockCountLSB,
+      header.logicalBlockSizeLSB
+    );
+    if (header.logicalBlockSizeLSB != 2048)
+      console.log('Warning: Unexpected block size, probably wrong\n');
+
+    sectorcount = header.volumeBlockCountLSB;
+  }
+}
+
+function AnalyseTrack(srcfile, modetxt, subchanbytes) {
+  strcpy(modetxt, 'AUDIO');
+  let isotrackbytes = 0;
+  let isotracksectors = 0;
+  let sectorsize = SIZERAW;
+
+  // To identify what kind of track is starting from the current sector, read and evaluate the
+  // first 50k bytes of the track.
+  let buffer;
+  // uint8_t buffer[50000];
+  let readpos = ftell(srcfile);
+  if (1 != fread(buffer, 50000, 1, srcfile)) {
+    perror('bin2iso(fread)');
+    exit(1);
+  }
+  let filesize = GetFileSize(srcfile);
+
+  if (memcmp(buffer, syncPattern, 12) == 0) {
+    // The track starts with a sync pattern. Double-check if the same pattern repeats after
+    // various possible sector sizes, and the second one's time index is greater than the
+    // first one's.
+    let timeindexA = (buffer[12] << 16) | (buffer[13] << 8) | buffer[14];
+
+    let found = false;
+    for (sectorsize = 2064; sectorsize < 2560; sectorsize += 4) {
+      if (memcmp(buffer + sectorsize, syncPattern, 12) != 0) continue;
+
+      let timeindexB =
+        (buffer[sectorsize + 12] << 16) |
+        (buffer[sectorsize + 13] << 8) |
+        buffer[sectorsize + 14];
+      if (timeindexB <= timeindexA || buffer[15] != buffer[sectorsize + 15])
+        continue;
+
+      console.log('(Track has sync pattern, indicates mode %d)\n', buffer[15]);
+      sconsole.log(modetxt, 'MODE%d/%d', buffer[15], sectorsize);
+
+      // If there's an ISO volume descriptor, we can know more about this track.
+      // It's from sector 16 onward (0x8000 in raw user data).
+      let hdrofs = sectorsize * 16;
+      hdrofs += buffer[15] == 1 ? 16 : 24; // skip sector preamble to user data
+      CheckIsoHeader(buffer + hdrofs, isotracksectors);
+      if (isotracksectors != 0) isotrackbytes = isotracksectors * sectorsize;
+      else console.log('(ISO descriptor was not found)\n');
+
+      // The image should go straight into audio tracks after the end of ISO data, but there
+      // may be several empty sectors with just the sync pattern.
+      while (true) {
+        if (0 != fseek(srcfile, readpos + isotrackbytes, SEEK_SET)) {
+          perror('\nbin2iso(fseek)');
+          exit(1);
+        }
+        if (1 != fread(buffer, 12, 1, srcfile)) {
+          if (feof(srcfile)) break;
+          perror('bin2iso(fread)');
+          exit(1);
+        }
+        if (memcmp(buffer, syncPattern, 12) != 0) break;
+        isotrackbytes += sectorsize;
+        isotracksectors++;
+      }
+
+      // Check that the remaining filesize is divisible by 2352. If not, the audio tracks
+      // may have subchannel data embedded.
+      let remaining = filesize - readpos - isotrackbytes;
+      if (remaining % SIZERAW != 0 && remaining % sectorsize != 0) {
+        console.log(
+          'Warning: Remaining image size %d is not divisible by %d or %d\n',
+          remaining,
+          SIZERAW,
+          sectorsize
+        );
+      } else {
+        if (sectorsize < SIZERAW)
+          console.log(
+            'Warning: Remaining image size %d uses unexpected sector size %d\n',
+            remaining,
+            sectorsize
+          );
+        else if (sectorsize > SIZERAW) {
+          subchanbytes = sectorsize - SIZERAW;
+          console.log(
+            '(Audio sectors embed %d bytes of subchannel data)\n',
+            subchanbytes
+          );
+        }
+      }
+
+      found = true;
+      break;
+    }
+
+    if (!found) {
+      console.log(
+        "(Found sync pattern but failed to recognise sector size; can't convert correctly)\n"
+      );
+    }
+  } else {
+    // No sync pattern detected. Probably raw 2048-byte user data, or audio track.
+    CheckIsoHeader(buffer + 0x8000, isotracksectors);
+    if (isotracksectors != 0) {
+      console.log('(Track has an ISO descriptor, indicates raw user data)\n');
+      strcpy(modetxt, 'MODE1/2048');
+      sectorsize = 2048;
+    } else {
+      // If the ISO volume descriptor is found at 0x9208, it's MODE2/2336.
+      CheckIsoHeader(buffer + 0x9208, isotracksectors);
+      if (isotracksectors != 0) {
+        console.log('(Track has an ISO descriptor, indicates mode2/2336)\n');
+        strcpy(modetxt, 'MODE2/2336');
+        sectorsize = 2336;
+      }
+      // If there's a UDF descriptor, it's a UDF filesystem, raw user data.
+      else if (memcmp(buffer + 0x8000, udfVolumeDescriptor, 8) == 0) {
+        console.log('(Track has a UDF ISO descriptor)\n');
+        strcpy(modetxt, 'MODE1/2048');
+        sectorsize = 2048;
+        isotracksectors = filesize / 2048;
+      } else {
+        console.log(
+          '(No sync pattern or ISO descriptor recognised, probably audio track)\n'
+        );
+      }
+    }
+
+    // There may be extra 2k-size sectors after the official end of ISO data, but they're
+    // likely all zeroed out. Ensure the rest of the file can be read in 2352-byte blocks and
+    // there are no bytes left over.
+    if (isotracksectors != 0) {
+      // Both 2048 and 2336 need to repeat at most 147 times to be 2352-aligned.
+      const maxcount = 147;
+
+      isotrackbytes = isotracksectors * sectorsize;
+      let remaining = filesize - readpos - isotrackbytes;
+      let count = 0;
+      while (count <= maxcount && remaining > 0 && remaining % SIZERAW != 0) {
+        remaining -= sectorsize;
+        count++;
+      }
+      if (count <= maxcount) {
+        isotrackbytes += count * sectorsize;
+        isotracksectors += count;
+      } else
+        console.log(
+          'Warning: Failed to align ISO track end, may still be ok\n'
+        );
+    }
+  }
+
+  if (0 != fseek(srcfile, readpos + isotrackbytes, SEEK_SET)) {
+    perror('\nbin2iso(fseek)');
+    exit(1);
+  }
+
+  return isotracksectors;
+}
+
+function CueFromBin() {
+  const fdBinFile = fs.openSync(options.sBinFilename, 'rb');
+  if (fdBinFile == NULL) {
+    console.log('Unable to open %s\n', options.sBinFilename);
+    exit(1);
+  }
+  const fdCueFile = fs.openSync(options.sCueFilename, 'w');
+  if (fdCueFile == NULL) {
+    console.log('Unable to create %s\n', options.sCueFilename);
+    exit(1);
+  }
+
+  let l = strlen(options.sBinFilename) - 4;
+  if (
+    strcmp(options.sBinFilename[l], '.wav') == 0 ||
+    strcmp(options.sBinFilename[l], '.WAV') == 0
+  ) {
+    console.log('.wav binfile - Skipping wav header\n');
+    fseek(fdBinFile, sizeof(tWavHead), SEEK_CUR);
+  } else if (
+    strcmp(options.sBinFilename[l], '.cdi') == 0 ||
+    strcmp(options.sBinFilename[l], '.CDI') == 0
+  ) {
+    console.log('Warning: CDI discjuggler images are not raw\n');
+    console.log(
+      'Alternative tools cdi2iso or iat will work better for this.\n'
+    );
+  }
+
+  console.log('FILE "%s" BINARY\n', options.sBinFilename);
+  fconsole.log(fdCueFile, 'FILE "%s" BINARY\n', options.sBinFilename);
+
+  let modetxt;
+  let indextxt;
+  let buffer; // this is a pointer to somewhere in inBuf, for zero-copy reads
+
+  let track = 0;
+  let subchanbytes = 0; // some exotic images include subchannel bytes on audio tracks
+  let sector = AnalyseTrack(fdBinFile, modetxt, subchanbytes);
+  if (sector != 0) {
+    console.log('  TRACK 01 %s\n', modetxt);
+    fconsole.log(fdCueFile, '  TRACK 01 %s\n', modetxt);
+    console.log('    INDEX 01 00:00:00\n');
+    fconsole.log(fdCueFile, '    INDEX 01 00:00:00\n');
+    track++;
+  }
+  strcpy(modetxt, 'AUDIO'); // assume everything after the first track is raw audio
+  let sectorsize = SIZERAW + subchanbytes; // assumes subchan data is at sector end
+  if (subchanbytes != 0) sconsole.log(modetxt, 'AUDIO/%d', sectorsize); // non-standard but consistent
+
+  // To split the audio stream into tracks, need to find the quietest or completely silent
+  // troughs between songs. Take a Root Mean Square from every audio sector. If the RMS is below
+  // a user-definable threshold, the sector may be a track gap. If several such sectors in a row
+  // (also user-definable number) are below the RMS threshold, generate a track split.
+  //
+  // When generating a split, must identify as precisely as possible when the previous song has
+  // really faded out entirely. That point is in the sector with the lowest RMS within the
+  // entire gap. If multiple sectors have the same lowest value (likely 0), the earliest gets to
+  // be the next track's Index 0 (pregap start), and the latest gets to be Index 1 (song start).
+  //
+  // Fades in and out can be tricky, since they have periods on both sides of the RMS limit for
+  // a significant number of sectors, producing false splits. A minimum track length requirement
+  // of several seconds may help against that for fade-ins. (Not implemented here.)
+  //
+  // Pops/clicks between tracks can generate a false split. To avoid this, require a minimum
+  // number of individual samples exceeding the RMS limit value within the sector.
+
+  //const uint32_t minTrackSecs = 8;
+  const minSampleHits = 120;
+  let gapsectors = 0;
+  let lowestRMS, lowestRMSsector0, lowestRMSsector1;
+  let limitsquared = options.splitRmsLimit * options.splitRmsLimit;
+
+  while (BufferedFRead(buffer, sectorsize, fdBinFile)) {
+    // Calculating RMS over 2352 samples requires a uint64 or the accumulator can overflow.
+    let RMS = 0;
+    let samplehits = 0;
+
+    for (let i = 0; i < SIZERAW; i += 2) {
+      let value = buffer[i] | (buffer[i + 1] << 8);
+      let squared = value * value;
+      RMS += squared;
+      if (squared > limitsquared) samplehits++;
+    }
+    RMS = RMS / SIZERAW;
+
+    if (RMS > limitsquared && samplehits > minSampleHits) {
+      if (gapsectors == 0) {
+        // This sector is above RMS limit, and not in a potential gap: do nothing.
+      } else {
+        // This sector is above RMS limit, and in a potential gap: generate split.
+        if (gapsectors >= options.splitGapLength) {
+          track++;
+          console.log('  TRACK %02d %s\n', track, modetxt);
+          fconsole.log(fdCueFile, '  TRACK %02d %s\n', track, modetxt);
+
+          TimeIndex(lowestRMSsector0, indextxt);
+          console.log('    INDEX 00 %s\n', indextxt);
+          fconsole.log(fdCueFile, '    INDEX 00 %s\n', indextxt);
+
+          TimeIndex(lowestRMSsector1, indextxt);
+          console.log('    INDEX 01 %s\n', indextxt);
+          fconsole.log(fdCueFile, '    INDEX 01 %s\n', indextxt);
+        }
+        gapsectors = 0;
+      }
+    } else {
+      if (gapsectors != 0) {
+        // This sector is below RMS limit, and in a potential gap: track gap.
+        if (RMS <= lowestRMS) {
+          if (RMS != lowestRMS) {
+            lowestRMS = RMS;
+            lowestRMSsector0 = sector;
+          }
+          lowestRMSsector1 = sector;
+        }
+      } else {
+        // This sector is below RMS limit, and not in a potential gap: new potential gap.
+        lowestRMS = RMS;
+        lowestRMSsector0 = sector;
+        lowestRMSsector1 = sector;
+      }
+      gapsectors++;
+    }
+
+    sector++;
+  }
+  fclose(fdCueFile);
+  fclose(fdBinFile);
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/ */
+
 function PrintHelp() {
   console.log(
-    '\nbin2iso ' +
-      VERSIONSTR +
-      ' - Converts raw BIN/IMG/MDF image files to ISO + WAV files'
+    `\nbin2iso - Converts raw BIN/IMG/MDF image files to ISO + WAV files`
   );
-  console.log('\nOriginal by Bob Doiron, this version by Kirinn Bunnylin');
-  console.log('\nhttps://gitlab.com/bunnylin/bin2iso\n\n');
+  console.log('\nJS implementation of the C version by Kirinn Bunnylin');
+  console.log('\nhttps://gitlab.com/bunnylin/bin2iso\n');
 
   console.log('Run this with a CUE file, not the raw image file.');
   console.log('To use CCD/MDS files, convert to CUE first (ccd2cue, mdf2iso).');
-  console.log('Usage: bin2iso <cuefile> [<output dir>] [-napib] [-t X]\n\n');
+  console.log('Usage: bin2iso <cuefile> [<output dir>] [-napib] [-t X]\n');
 
   console.log(
     '  <cuefile>     The .CUE file for the image file being converted.'
@@ -683,9 +1374,8 @@ function PrintHelp() {
     "  -a --gaps     Save 'gaps' only if they contain notable non-zero data."
   );
   console.log(
-    '                Looks for more than 1/2 block of non-zeroes (' +
-      SIZERAW / 2 / 2 +
-      ' values).'
+    '                Looks for more than 1/2 block of non-zeroes (%d values).',
+    SIZERAW / 2 / 2
   );
   console.log(
     '                Without -n or -a, by default all gap data is saved.'
@@ -700,18 +1390,17 @@ function PrintHelp() {
   );
   console.log("                (can't be used with -t)");
   console.log(
-    '  -b --nob      Do not use overburn data past ' +
-      CD74_MAX_SECTORS +
-      ' sectors.'
+    '  -b --nob      Do not use overburn data past %d sectors.',
+    CD74_MAX_SECTORS
   );
   console.log(
-    '                This of course presumes that the data is not useful.\n\n'
+    '                This of course presumes that the data is not useful.\n'
   );
 
   console.log(
     'Use the -c switch to auto-generate a CUE file from any raw image.'
   );
-  console.log('Usage: bin2iso <cuefile> -c <binfile> [-l X] [-w X]\n\n');
+  console.log('Usage: bin2iso <cuefile> -c <binfile> [-l X] [-w X]\n');
 
   console.log('  -c --cuefrom=<binfile>');
   console.log(
@@ -721,16 +1410,15 @@ function PrintHelp() {
     '  -l --level=X  When creating a cuefile, split audio tracks when many sectors'
   );
   console.log(
-    '                in a row are below this volume (RMS) level. Default: ' +
-      options.splitRmsLimit
+    '                in a row are below this volume (RMS) level. Default: %d',
+    options.splitRmsLimit
   );
   console.log(
     '  -w --width=X  When creating a cuefile, split audio tracks when this many'
   );
   console.log(
-    '                sectors are below the RMS limit. 75 = 1 second. Default: ' +
-      options.splitGapLength +
-      '\n\n'
+    '                sectors are below the RMS limit. 75 = 1 second. Default: %d\n',
+    options.splitGapLength
   );
 
   console.log(
@@ -741,170 +1429,274 @@ function PrintHelp() {
   );
 }
 
-const options = {
-  allPostGaps: true,
-  splitRmsLimit: 80,
-  splitGapLength: 48,
-  outputDir: './',
-  noGaps: false,
-  autoGaps: false,
-  doInPlace: false,
-  doOneTrack: false,
-  oneTrackNum: null,
-  noOverburn: false,
-  createCue: false,
-  sBinFilename: '',
-  sCueFilename: '',
-};
+// function ParseArgs(argc, argv) {
+//   const short_opts = 'napt:ibc:l:w:vh?';
+//   long_opts = [];
+//   // long_opts = [
+//   // 	{ "nogaps", no_argument, NULL, 'n' },
+//   // 	{ "gaps", no_argument, NULL, 'a' },
+//   // 	{ "pregaps", no_argument, NULL, 'p' },
+//   // 	{ "track", required_argument, NULL, 't' },
+//   // 	{ "inplace", no_argument, NULL, 'i' },
+//   // 	{ "nob", no_argument, NULL, 'b' },
+//   // 	{ "cuefrom", required_argument, NULL, 'c' },
+//   // 	{ "level", required_argument, NULL, 'l' },
+//   // 	{ "width", required_argument, NULL, 'w' },
+//   // 	{ "version", no_argument, NULL, 'v' },
+//   // 	{ "help", no_argument, NULL, 'h' },
+//   // 	{ NULL, no_argument, NULL, 0 }
+//   // ];
+//   let optind = 0;
 
-function parseArgs(argc, argv) {
-  const shortOpts = 'napt:ibc:l:w:vh?';
-  const longOpts = [
-    { name: 'nogaps', hasArg: false, val: 'n' },
-    { name: 'gaps', hasArg: false, val: 'a' },
-    { name: 'pregaps', hasArg: false, val: 'p' },
-    { name: 'track', hasArg: true, val: 't' },
-    { name: 'inplace', hasArg: false, val: 'i' },
-    { name: 'nob', hasArg: false, val: 'b' },
-    { name: 'cuefrom', hasArg: true, val: 'c' },
-    { name: 'level', hasArg: true, val: 'l' },
-    { name: 'width', hasArg: true, val: 'w' },
-    { name: 'version', hasArg: false, val: 'v' },
-    { name: 'help', hasArg: false, val: 'h' },
-  ];
+//   options.allPostGaps = true; // convert all pregaps to postgaps by default
+//   options.splitRmsLimit = 80;
+//   options.splitGapLength = 48; // 0.64 seconds
+//   options.outputDir = './'; // default path
 
-  // TODO Making this a global?
-  //   const options = {
-  //     allPostGaps: true,
-  //     splitRmsLimit: 80,
-  //     splitGapLength: 48,
-  //     outputDir: './',
-  //     noGaps: false,
-  //     autoGaps: false,
-  //     doInPlace: false,
-  //     doOneTrack: false,
-  //     oneTrackNum: null,
-  //     noOverburn: false,
-  //     createCue: false,
-  //     sBinFilename: '',
-  //     sCueFilename: '',
-  //   };
+//   while (true) {
+//     const opt = getopt_long(argc, argv, short_opts, long_opts, null);
+//     if (opt == -1) break;
 
-  let optind = 0;
+//     let optarg = [];
+//     if (optarg) if (optarg[0] == '=' || optarg[0] == ':') optarg++;
 
-  while (true) {
-    const { opt, optarg } = getOptLong(argc, argv, shortOpts, longOpts, optind);
-    if (opt === -1) break;
+//     switch (opt) {
+//       case 'n':
+//         options.noGaps = true;
+//         break;
 
-    if (optarg && (optarg[0] === '=' || optarg[0] === ':')) {
-      optarg = optarg.substring(1);
-    }
+//       case 'a':
+//         options.autoGaps = true;
+//         break;
 
-    switch (opt) {
-      case 'n':
-        options.noGaps = true;
-        break;
+//       case 'p':
+//         options.allPostGaps = false;
+//         break;
 
-      case 'a':
-        options.autoGaps = true;
-        break;
+//       case 't': {
+//         if (options.doInPlace) {
+//           console.log("Can't use -t and -i together.\n");
+//           return false;
+//         }
+//         options.oneTrackNum = strtol(optarg, NULL, 10);
+//         options.doOneTrack = true;
+//         break;
+//       }
 
-      case 'p':
-        options.allPostGaps = false;
-        break;
+//       case 'i':
+//         if (options.doOneTrack) {
+//           console.log("Can't use -t and -i together.\n");
+//           return false;
+//         }
+//         console.log('Bin file will be truncated after each track created\n');
+//         options.doInPlace = true;
+//         break;
 
-      case 't':
-        if (options.doInPlace) {
-          console.log("Can't use -t and -i together.");
-          return false;
-        }
-        options.oneTrackNum = parseInt(optarg, 10);
-        options.doOneTrack = true;
-        break;
+//       case 'b':
+//         options.noOverburn = true;
+//         break;
 
-      case 'i':
-        if (options.doOneTrack) {
-          console.log("Can't use -t and -i together.");
-          return false;
-        }
-        console.log('Bin file will be truncated after each track created');
-        options.doInPlace = true;
-        break;
+//       case 'c':
+//         options.createCue = true;
+//         strcpy(options.sBinFilename, optarg);
+//         break;
 
-      case 'b':
-        options.noOverburn = true;
-        break;
+//       case 'l':
+//         // options.splitRmsLimit = (uint16_t)strtol(optarg, NULL, 10);
+//         break;
 
-      case 'c':
-        options.createCue = true;
-        options.sBinFilename = optarg;
-        break;
+//       case 'w':
+//         // options.splitGapLength = (uint16_t)strtol(optarg, NULL, 10);
+//         break;
 
-      case 'l':
-        options.splitRmsLimit = parseInt(optarg, 10);
-        break;
+//       case 'v':
+//         console.log(VERSIONSTR + '\n');
+//         exit(0);
+//         break;
 
-      case 'w':
-        options.splitGapLength = parseInt(optarg, 10);
-        break;
+//       case '?':
+//       case 'h':
+//       default:
+//         return false;
+//     }
+//   }
 
-      case 'v':
-        console.log(VERSIONSTR);
-        process.return;
-        break;
+//   if (optind == argc) {
+//     console.log('<cuefile> must be specified.\n');
+//     return false;
+//   }
 
-      case '?':
-      case 'h':
-      default:
-        return false;
-    }
-  }
+//   options.sCueFilename = argv[optind++];
+//   if (optind < argc) {
+//     options.outputDir = argv[optind++];
+//     let i = options.outputDir.length;
+//     if (i > 0) {
+//       if (options.outputDir[i - 1] != '/' && options.outputDir[i - 1] != ':') {
+//         options.outputDir += '/';
+//       }
+//     }
+//   }
 
-  if (optind === argc || argc === undefined) {
-    console.log('<cuefile> must be specified.');
-    return false;
-  }
-  options.sCueFilename = argv[optind++];
-  if (optind < argc) {
-    options.outputDir = argv[optind++];
-    const i = options.outputDir.length;
-    if (i > 0) {
-      if (
-        options.outputDir[i - 1] !== '/' &&
-        options.outputDir[i - 1] !== ':'
-      ) {
-        options.outputDir += '/';
+//   if (optind < argc) {
+//     console.log('Unexpected argument: %s\n', argv[optind]);
+//     return false;
+//   }
+
+//   return true;
+// }
+
+// Mock function for getopt_long to simulate option parsing
+// function getopt_long(argc, argv, shortOpts, longOpts, optind) {
+//   // This function should implement the logic to parse command line arguments
+//   // and return the appropriate option and argument. This is a placeholder.
+//   return -1; // Replace with actual parsing logic
+// }
+
+// function main(argc, argv) {
+//   if (!ParseArgs(argc, argv)) {
+//     PrintHelp();
+//     return 1;
+//   }
+
+//   if (options.createCue) {
+//     // CueFromBin();
+//   } else {
+//     IsoFromCue();
+//   }
+
+//   return 0;
+// }
+
+// main(1, ['test/test.cue']);
+
+/**
+ * Parse command-line arguments or args passed via API
+ */
+function parseArgs(argv) {
+  options.noGaps = false;
+  options.autoGaps = false;
+  options.allPostGaps = true;
+  options.doInPlace = false;
+  options.noOverburn = false;
+  options.createCue = false;
+  options.doOneTrack = false;
+  options.splitRmsLimit = 80;
+  options.splitGapLength = 48;
+
+  let i = 0;
+
+  while (i < argv.length) {
+    let arg = argv[i];
+
+    if (arg === '-n' || arg === '--nogaps') {
+      options.noGaps = true;
+    } else if (arg === '-a' || arg === '--gaps') {
+      options.autoGaps = true;
+    } else if (arg === '-p' || arg === '--pregaps') {
+      options.allPostGaps = false;
+    } else if (arg === '-t' || arg === '--track') {
+      if (options.doInPlace) {
+        console.error("Can't use --track (-t) and --inplace (-i) together.");
+        process.exit(1);
       }
+      i++;
+      options.oneTrackNum = parseInt(argv[i], 10);
+      options.doOneTrack = true;
+    } else if (arg === '-i' || arg === '--inplace') {
+      if (options.doOneTrack) {
+        console.error("Can't use --track (-t) and --inplace (-i) together.");
+        process.exit(1);
+      }
+      options.doInPlace = true;
+    } else if (arg === '-b' || arg === '--nob') {
+      options.noOverburn = true;
+    } else if (arg === '-c' || arg === '--cuefrom') {
+      i++;
+      options.createCue = true;
+      options.sBinFilename = argv[i];
+    } else if (arg === '-l' || arg === '--level') {
+      i++;
+      options.splitRmsLimit = parseInt(argv[i], 10);
+    } else if (arg === '-w' || arg === '--width') {
+      i++;
+      options.splitGapLength = parseInt(argv[i], 10);
+    } else if (arg === '-v' || arg === '--version') {
+      console.log(VERSIONSTR);
+      process.exit(0);
+    } else if (arg === '-h' || arg === '--help') {
+      printHelp();
+      process.exit(0);
+    } else if (!options.sCueFilename) {
+      options.sCueFilename = arg;
+    } else if (!options.outputFile) {
+      options.outputFile = arg;
+    } else {
+      console.error('Unknown argument: ' + arg);
+      printHelp();
+      process.exit(1);
     }
-  }
-  if (optind < argc) {
-    console.log(`Unexpected argument: ${argv[optind]}`);
-    return false;
+
+    i++;
   }
 
-  return true;
+  if (!options.sCueFilename) {
+    console.error('Missing <cuefile> argument.\n');
+    printHelp();
+    process.exit(1);
+  }
+
+  if (!options.outputFile) {
+    options.outputFile = 'output.iso';
+    console.log(
+      'Missing <outputfile> argument. Defaulting to',
+      options.outputFile,
+      '\n'
+    );
+  }
+  // if (!options.outputDir) {
+  //   options.outputDir = './';
+  // }
+
+  // if (!options.outputDir.endsWith('/') && !options.outputDir.endsWith(':')) {
+  //   options.outputDir += '/';
+  // }
+}
+/**
+ * Print Help
+ */
+function printHelp() {
+  console.log(`Usage: bin2iso [options] <cuefile> <outputfile>
+
+Options:
+-n, --nogaps         Disable gaps
+-a, --gaps           Enable gaps
+-p, --pregaps        Use pregaps instead of postgaps
+-t, --track <num>    Convert specific track
+-i, --inplace        In-place conversion
+-b, --nob            Disable overburn
+-c, --cuefrom <bin>  Create cue from bin
+-l, --level <num>    Set split RMS limit (default 80)
+-w, --width <num>    Set split gap length (default 48)
+-v, --version        Show version
+-h, --help           Show this help
+`);
 }
 
-// Mock function for getOptLong to simulate option parsing
-function getOptLong(argc, argv, shortOpts, longOpts, optind) {
-  // This function should implement the logic to parse command line arguments
-  // and return the appropriate option and argument. This is a placeholder.
-  return { opt: -1, optarg: null }; // Replace with actual parsing logic
-}
-
-function main(argc, argv) {
-  if (!parseArgs(argc, argv)) {
-    PrintHelp();
-    return 1;
-  }
+if (require.main === module) {
+  // CLI
+  parseArgs(process.argv.slice(2));
 
   if (options.createCue) {
-    CueFromBin();
+    // CueFromBin();
   } else {
     IsoFromCue();
   }
-
-  return 0;
+} else {
+  // Programmatic API
+  module.exports = {
+    parseArgs,
+    IsoFromCue,
+    // CueFromBin,
+    // options,
+  };
 }
-
-main(1, ['C:\\Users\\Jah.DESKTOP-JK06E9D\\Downloads\\Coffee-Tycoon_Win_EN_CD']);
