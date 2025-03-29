@@ -372,14 +372,13 @@ function FlushBuffers(fdBinFile) {
 
 function DoTrack(track) {
   // let fdBinFile = track.fdSrcFile;
-  let buffer; // this is a pointer to somewhere in inBuf, for zero-copy reads
   let remainingsectors = track.totalSectors;
 
   let sOutFilename;
   // strcpy(sOutFilename, options.outputDir);
   // strcat(sOutFilename, track.name);
   sOutFilename = options.outputDir + track.name;
-  console.log('Writing %s (', sOutFilename);
+  console.log('Writing ', sOutFilename);
 
   // In 2352-byte modes, there's some metadata in each sector that needs to be skipped when
   // copying the user data.
@@ -396,30 +395,28 @@ function DoTrack(track) {
       console.log('Audio with subchannel data');
       break;
     case MODE1_2352:
-      console.log('Mode1/2352');
+      console.log('Using Mode1/2352');
       break;
     case MODE1_2048:
-      console.log('Mode1/2048');
+      console.log('Using Mode1/2048');
       break;
     case MODE1_2448:
-      console.log('Mode1/2448');
+      console.log('Using Mode1/2448');
       break;
     case MODE2_2352:
-      console.log('Mode2/2352');
+      console.log('Using Mode2/2352');
       break;
     case MODE2_2336:
-      console.log('Mode2/2336');
+      console.log('Using Mode2/2336');
       break;
     default:
       console.log('Unexpected mode!');
       exit(1);
   }
-  console.log('): ');
   let datasize = track.sectorSize - track.predata - track.postdata;
 
   // TODO:
   // sOutFilename -> './TEST-01.iso'
-  console.error('OPENING: ', sOutFilename);
   // fdOutFile = fs.openSync(sOutFilename, 'w');
   const fdOutFile = fs.createWriteStream(sOutFilename);
   if (fdOutFile == null) {
@@ -470,47 +467,31 @@ function DoTrack(track) {
     }
   }
 
-  console.error('START:   ', track.startOfs);
   const fdBinFile = fs.createReadStream('TEST/TEST.bin', {
     start: track.startOfs,
   });
   let bytesWritten = 0;
   // Setup buffering and writing
+  let buffer = Buffer.alloc(0); // this is a pointer to somewhere in inBuf, for zero-copy reads
   fdBinFile.on('data', (chunk) => {
-    // Append the chunk data to our internal buffer
-    let remaining = chunk.length;
-    let readStart = 0;
+    buffer = Buffer.concat([buffer, chunk]); // accumulate
 
-    while (remaining > 0) {
-      // If we need to refill the buffer
-      if (inBufReadIndex >= inBufWriteIndex) {
-        // Refill buffer with new data from the file stream
-        chunk.copy(
-          inBuf,
-          0,
-          readStart,
-          readStart + Math.min(inBuf.length, remaining)
-        );
-        inBufWriteIndex = Math.min(inBuf.length, remaining);
-        inBufReadIndex = 0;
-        readStart += inBufWriteIndex;
-        remaining -= inBufWriteIndex;
-      }
+    while (buffer.length >= track.sectorSize) {
+      const sector = buffer.slice(0, track.sectorSize); // extract full sector
 
-      // Prepare the data to write (take care of predata/postdata)
-      const dataToWrite = inBuf.slice(
-        inBufReadIndex + track.predata,
-        inBufReadIndex + track.sectorSize - track.postdata
+      const dataToWrite = sector.slice(
+        track.predata,
+        track.sectorSize - track.postdata
       );
+
       fdOutFile.write(dataToWrite);
       bytesWritten += dataToWrite.length;
 
-      inBufReadIndex += track.sectorSize; // Move the read index forward
+      buffer = buffer.slice(track.sectorSize); // remove processed sector
     }
   });
 
   fdBinFile.on('end', () => {
-    console.error(bytesWritten, datasize);
     console.log('File write completed');
     fdOutFile.end();
   });
@@ -864,6 +845,7 @@ function CheckGaps(track) {
   let buf; // uint8_t buf[track.sectorSize];
   let nonzerocount = 0;
   let pregapsectors = track.idx1 - track.idx0;
+  console.error('PREGAPSECTORS: ', pregapsectors);
   while (pregapsectors-- != 0) {
     if (0 == fread(buf, track.sectorSize, 1, track.fdSrcFile)) {
       perror('bin2iso(fread)');
