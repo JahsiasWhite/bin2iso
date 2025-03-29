@@ -1,5 +1,7 @@
 const fs = require('fs');
 
+const VERSIONSTR = '1.0.1';
+
 //----------------Wave Stuff---------------------/
 class WavHdr {
   constructor() {
@@ -105,7 +107,6 @@ class options {
 // FILE * fdOutFile;
 let fdOutFile;
 let cueDirectory = '';
-const VERSIONSTR = '1.0.1';
 
 // Best buffer size varies by machine, 1-4Mb generally best. 2Mb write worked best on my machine.
 // I also tried doing direct fwrites instead of buffering, but that was slightly slower somehow.

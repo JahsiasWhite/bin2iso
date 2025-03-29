@@ -32,18 +32,19 @@ npm install
 
 ## 🛠 Usage
 
+### Node.js
+
+```js
+const bin2iso = require('bin2iso');
+
+bin2iso.parseArgs(['MY/FOLDER/PATH/Input.cue']);
+bin2iso.IsoFromCue();
+```
+
 ### CLI
 
 ```bash
 bin2iso input.bin output.iso
-```
-
-### Node.js
-
-```js
-import { convert } from 'bin2iso';
-
-await convert('input.bin', 'output.iso');
 ```
 
 ## 🐇 Credits & Acknowledgements
