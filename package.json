@@ -1,0 +1,13 @@
+{
+  "name": "bin2iso",
+  "version": "1.0.0",
+  "description": "Convert raw .bin CD-ROM images into valid .iso images",
+  "main": "bin2iso.js",
+  "keywords": [
+    "bin2iso",
+    "iso",
+    "bin",
+    "converter"
+  ],
+  "author": "Jahsias"
+}
